@@ -1,0 +1,369 @@
+---
+title: "Hemochromatosis regenie interaction"
+author: "Jarkko Toivonen"
+format: html
+---
+
+
+
+```{r setup}
+library(tidyverse)
+library(glue)
+library(scales)
+
+result_path <- "../results"
+```
+
+```{r}
+all_snip_info <- read_tsv(file.path(result_path, "all_snip_info.tsv"))
+all_snip_info
+```
+
+## Pipeline solution
+
+### Full chromosome 6 unadjusted
+
+#### Form input datas
+
+Phenolist.
+
+```{r}
+cat("E4_IRON_MET\n", file="../results/phenolist_regenie.txt")
+```
+
+List of chunks for step 2. Only chunks in chromosome 6.
+
+```{r}
+cmd <- "grep R12_6 /finngen/library-red/finngen_R12/bgen_2.0/finngen_R12_bgen_2.0_chunks.txt > ../results/finngen_R12_bgen_2.0_chr6_chunks.txt"
+system(cmd)
+```
+
+#### Copy files to red.
+
+```{r}
+cmd <- "gsutil cp ../results/phenolist_regenie.txt ../results/snips.bgen ../results/snips.bgen.bgi ../results/snips.bgen.sample ../results/finngen_R12_bgen_2.0_chr6_chunks.txt gs://fg-production-sandbox-5-red/toivoja/hemochromatosis/"
+print(cmd)
+system(cmd)
+```
+
+#### Run the pipeline
+
+```{r}
+cmd <- glue("zip regenie_sub_wdl.zip regenie_step1.wdl regenie_sub.wdl")
+print(cmd)
+system(cmd)
+```
+
+```{r}
+wdl <- "regenie.wdl"
+json <- "hemochromatosis_C282Y_R12.json"
+zip <- "regenie_sub_wdl.zip"
+cmd <- glue("finngen-cli request-workflow --wdl {wdl} --input {json} -d {zip}")
+print(cmd)
+system(cmd)
+```
+
+ID: 43ab9fe1-d4af-4e56-99a5-b16a7d2f13b6
+This failed probably because it did not copy the interaction genotype file from red.
+
+ID: 3d2c8419-9eea-4657-8c6b-532a6c1442cb
+Now this works! But it took 47 hours to compute.
+
+
+
+#### Show results
+
+```{r}
+filename <- "/finngen/pipeline/cromwell/workflows/regenie/3d2c8419-9eea-4657-8c6b-532a6c1442cb/call-sub_step2/shard-0/sub.regenie_step2/30f67594-050c-4365-a1ea-719207690455/call-gather/shard-0/glob-5ca4ed51ac4bdf19c196d5e2c2cae537/E4_IRON_MET.regenie.gz"
+chr6 <- read_delim(filename, delim=" ")
+```
+
+
+
+
+```{r}
+significance_level <- -log10(5e-8 / 6)    # Regenie performs six tests
+chr6_filtered <- chr6 %>% filter(LOG10P >= -log10(0.05))   # Coarse filtering to produce a smaller data set
+```
+
+```{r}
+significant <- chr6_filtered %>% filter(LOG10P >= significance_level &
+                                        TEST == "ADD-INT_SNPxchr6_26092913_G_A")
+significant
+```
+
+```{r}
+r <- range(significant$GENPOS)
+r
+f <- function(x) format(x, big.mark=",")
+sprintf("Range is %s - %s, width is %s, %i significant snips", f(r[1]), f(r[2]), f(r[2]-r[1]), nrow(significant))
+```
+
+Are our know snips among these?
+
+```{r}
+significant_with_names <- significant %>% 
+  left_join(all_snip_info %>% select(pos_hg38, name), by=c(GENPOS="pos_hg38")) %>% 
+  select(CHROM, GENPOS, ID, name, BETA, SE, CHISQ, LOG10P)
+significant_with_names %>% arrange(name)
+```
+
+Only snips H1-2 and H63D were found!
+
+```{r}
+g <- chr6_filtered %>% 
+  mutate(TEST = str_replace(TEST, "chr6_26092913_G_A", "C282Y")) %>%   # Shorter name
+  ggplot(aes(x=GENPOS, y=LOG10P)) + 
+  geom_point() + 
+  geom_hline(yintercept = significance_level, color="red") +
+  labs(x="Position") +
+  scale_x_continuous(labels = scales::label_number(scale_cut = scales::cut_short_scale(), suffix="bp")) +
+  facet_wrap(~ TEST, scales = "free")
+g
+filename <- "../results/figures/chr6_C282Y_interactions.png"
+ggsave(filename, g)
+```
+
+### Adjusted single block pipeline
+
+#### Form input datas
+
+```{r}
+covariate_string <- "SEX_IMPUTED,AGE_AT_DEATH_OR_END_OF_FOLLOWUP,PC{1:10},IS_FINNGEN2_CHIP,BATCH_DS1_BOTNIA_Dgi_norm,BATCH_DS10_FINRISK_Palotie_norm,BATCH_DS11_FINRISK_PredictCVD_COROGENE_Tarto_norm,BATCH_DS12_FINRISK_Summit_norm,BATCH_DS13_FINRISK_Bf_norm,BATCH_DS14_GENERISK_norm,BATCH_DS15_H2000_Broad_norm,BATCH_DS16_H2000_Fimm_norm,BATCH_DS17_H2000_Genmets_norm_relift,BATCH_DS18_MIGRAINE_1_norm_relift,BATCH_DS19_MIGRAINE_2_norm,BATCH_DS2_BOTNIA_T2dgo_norm,BATCH_DS20_SUPER_1_norm_relift,BATCH_DS21_SUPER_2_norm_relift,BATCH_DS22_TWINS_1_norm,BATCH_DS23_TWINS_2_norm_nosymmetric,BATCH_DS24_SUPER_3_norm,BATCH_DS25_BOTNIA_Regeneron_norm,BATCH_DS26_DIREVA_norm,BATCH_DS27_NFBC66_norm,BATCH_DS28_NFBC86_norm,BATCH_DS3_COROGENE_Sanger_norm,BATCH_DS4_FINRISK_Corogene_norm,BATCH_DS5_FINRISK_Engage_norm,BATCH_DS6_FINRISK_FR02_Broad_norm_relift,BATCH_DS7_FINRISK_FR12_norm,BATCH_DS8_FINRISK_Finpcga_norm,BATCH_DS9_FINRISK_Mrpred_norm"
+covariate_string <- str_replace(covariate_string, fixed("PC{1:10}"), glue("PC{1:10}") %>% paste(collapse=","))
+covariates <- str_split_1(covariate_string, pattern = ",")
+```
+
+```{r}
+wanted_column_names <- c("FID", "IID", covariates, "E4_IRON_MET")
+```
+
+```{r}
+cov_pheno_filename <- "/finngen/library-red/finngen_R12/analysis_covariates/R12_COV_PHENO_V2.FID.txt.gz"
+tmp <- read_tsv(cov_pheno_filename, n_max = 0)
+column_names <- colnames(tmp)
+```
+
+Which column to extract, as indices.
+
+```{r}
+wanted_col_indices <- which(column_names %in% wanted_column_names)
+```
+
+Extract the columns from the pheno cov file.
+
+```{r}
+cmd <- glue("zcat {cov_pheno_filename} | cut -f {paste(wanted_col_indices, collapse=',')} | gzip > /tmp/cov_pheno.tsv.gz")
+print(cmd)
+system(cmd)
+```
+
+```{r}
+pheno_cov <- read_tsv("/tmp/cov_pheno.tsv.gz")
+```
+
+Read the dosages of the five snips.
+
+```{r}
+dosages <- read_delim("../results/snips.dosage", delim=" ")
+```
+
+Transpose the dataframe.
+
+```{r}
+dosages <- dosages %>% 
+  select(-c(chromosome, rsid, position, alleleA, alleleB))%>% 
+  column_to_rownames("SNPID") %>% 
+  t() %>% 
+  as_tibble(rownames = "FID")
+```
+
+```{r}
+pheno_cov <- pheno_cov %>%
+  inner_join(dosages, by="FID")
+```
+
+```{r}
+write_tsv(pheno_cov, "/tmp/interaction_hc_pheno_cov_adjusted.tsv.gz")
+```
+
+Phenolist.
+
+```{r}
+cat("E4_IRON_MET\n", file="../results/phenolist_regenie.txt")
+```
+
+List of chunks for step 2.
+
+Interactions were in range 25897390 - 26135271, so the chunk chr6.5 should cover that,
+since its range is chr6_24790610_G_A - chr6_29748049_G_C.
+
+```{r}
+cmd <- "grep R12_6.5 /finngen/library-red/finngen_R12/bgen_2.0/finngen_R12_bgen_2.0_chunks.txt > ../results/finngen_R12_bgen_2.0_chr6.5_chunks.txt"
+system(cmd)
+```
+
+Add the four snips (H1-2, H63D, S65C, HLA3=supersnip), but not C282Y, as covariates.
+
+```{r}
+cat(c(covariates, c("chr6_26071867_A_C", "chr6_26090951_C_G", "chr6_26090957_A_T", "chr6_32636375_A_G")), sep=",")
+```
+
+#### Copy files to red
+
+
+Copy files to red.
+
+```{r}
+cmd <- "gsutil cp ../results/phenolist_regenie.txt ../results/snips.bgen ../results/snips.bgen.bgi ../results/snips.bgen.sample ../results/finngen_R12_bgen_2.0_chr6.5_chunks.txt /tmp/interaction_hc_pheno_cov_adjusted.tsv.gz gs://fg-production-sandbox-5-red/toivoja/hemochromatosis/"
+print(cmd)
+system(cmd)
+```
+
+#### Run the pipeline
+
+```{r}
+cmd <- glue("zip regenie_sub_wdl.zip regenie_step1.wdl regenie_sub.wdl")
+print(cmd)
+system(cmd)
+```
+
+```{r}
+wdl <- "regenie.wdl"
+json <- "hemochromatosis_C282Y_interaction_adjusted_R12.json"
+zip <- "regenie_sub_wdl.zip"
+cmd <- glue("finngen-cli request-workflow --wdl {wdl} --input {json} -d {zip}")
+print(cmd)
+system(cmd)
+```
+
+ID: b0bba1f3-12ca-4420-a278-8cfbad1f1d73
+
+#### Show results
+
+```{r}
+filename <- "/finngen/pipeline/cromwell/workflows/regenie/b0bba1f3-12ca-4420-a278-8cfbad1f1d73/call-sub_step2/shard-0/sub.regenie_step2/86ce537c-1cf9-4c45-8023-c0e04acd0fff/call-gather/shard-0/glob-5ca4ed51ac4bdf19c196d5e2c2cae537//E4_IRON_MET.regenie.gz"
+chr6.5_adjusted <- read_delim(filename, delim=" ")
+```
+
+```{r}
+significance_level <- -log10(5e-8 / 6)   # Regenie performs six different tests
+chr6.5_adjusted_filtered <- chr6.5_adjusted %>% filter(LOG10P >= -log10(0.05))
+```
+
+```{r}
+significant_adjusted <- chr6.5_adjusted_filtered %>% filter(LOG10P >= significance_level &
+                                                     TEST == "ADD-INT_SNPxchr6_26092913_G_A")
+significant_adjusted
+```
+
+```{r}
+r <- range(significant_adjusted$GENPOS)
+r
+f <- function(x) format(x, big.mark=",")
+sprintf("Range is %s - %s, width is %s", f(r[1]), f(r[2]), f(r[2]-r[1]))
+sprintf("%i significant interacting snips found", nrow(significant_adjusted))
+```
+
+Are our known snips among these?
+
+```{r}
+significant_adjusted_with_names <- significant_adjusted %>% 
+  left_join(all_snip_info %>% select(pos_hg38, name), by=c(GENPOS="pos_hg38")) %>% 
+  select(CHROM, GENPOS, ID, name, BETA, SE, CHISQ, LOG10P)
+significant_adjusted_with_names %>% arrange(name)
+```
+
+Nothing familiar found.
+
+```{r}
+g <- chr6.5_adjusted_filtered %>%
+  mutate(TEST = str_replace(TEST, "chr6_26092913_G_A", "C282Y")) %>%   # Shorter name
+  ggplot(aes(x=GENPOS, y=LOG10P)) + 
+  geom_point() + 
+  geom_hline(yintercept = significance_level, color="red") +
+  labs(x="Position") +
+  scale_x_continuous(labels = scales::label_number(scale_cut = scales::cut_short_scale(), suffix="bp")) +
+  facet_wrap(~ TEST, scales = "free")
+filename <- "../results/figures/chr6.5_C282Y_adjusted_interactions.png"
+#ggsave(filename, g, width=7.29, height=4.5, units = "in")
+ggsave(filename, g, width=8, height=4.5, units = "in")
+g
+```
+
+Where did the main effect of C282Y go? Maybe this has something to do with H1-2 and C282Y being highly correlated?
+
+Why are there more significant snips than in the unadjusted version?
+
+Write snip ids to a file for later processing.
+
+```{r}
+snip_id_filename <- file.path(result_path, "interacting_snips_ids.tsv")
+if (! file.exists(snip_id_filename))
+  write_tsv(significant_adjusted %>% select(ID), snip_id_filename, col_names = FALSE)
+```
+
+
+## Non-pipeline Regenie result
+
+This was done with the run_regenie_with_interactions.sh script.
+
+### Chromosome 6, chunk 5 only
+
+```{r}
+filename <- "/home/ivm/hemochromatosis/results/regenie_interaction/result.finngen_R12_6.5_E4_IRON_MET.regenie.gz"
+chr6.5 <- read_delim(filename, delim=" ")
+```
+
+This one chunk took 5400 seconds to run on the largest machine (with 16 cores, but I used 15 cores). There are 33 chunks in total in chromosome 6, so
+running them all would take 5400*33/3600 = ~50 hours.
+
+See https://rgcgithub.github.io/regenie/options/#interaction-testing
+for explanation of the different tests performed.
+
+```{r}
+significance_level <- -log10(5e-8/6)
+chr6.5 %>% ggplot(aes(x=GENPOS, y=LOG10P)) + 
+  geom_point() + 
+  geom_hline(yintercept = significance_level, color="red") +
+  labs(x="Position") +
+  facet_wrap(~ TEST, scales = "free")
+```
+
+ADD-INT_2DF is the joint test of the whether main or interaction effect is non-zero.
+
+ADD-INT_SNPxchr6_26092913_G_A is the test for interaction.
+
+Which snips had interactions with C282Y?
+
+```{r}
+chr6.5 %>% filter(TEST == "ADD-INT_SNPxchr6_26092913_G_A")%>% filter(LOG10P >= significance_level)
+```
+
+Get snip annotation for chr 6.
+
+```{bash}
+filename=/finngen/library-green/finngen_R12/finngen_R12_analysis_data/annotations/R12_annotated_variants_v1.small.gz
+output=../results/annotations-chr6.tsv.gz
+if [[ ! -f $output ]] ; then
+  zcat $filename | sed -n '1p;/^6:/p' | cut -f 1-5,10-12 | gzip > $output
+fi
+```
+
+```{r}
+output <- "../results/annotations-chr6.tsv.gz"
+annotations6 <- read_tsv(output)
+annotations6 <- annotations6 %>% select(-`#variant`) %>%
+  mutate(ID = glue("chr{chr}_{pos}_{ref}_{alt}"))
+annotations6
+```
+
+```{r}
+annotated_chr6.5 <- chr6.5 %>% filter(TEST == "ADD-INT_SNPxchr6_26092913_G_A")%>% filter(LOG10P >= significance_level) %>% left_join(annotations6, by="ID")
+```
+
+```{r}
+annotated_chr6.5 %>% select(gene_most_severe) %>% table()
+```
+
+

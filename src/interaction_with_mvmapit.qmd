@@ -1,0 +1,279 @@
+---
+title: "Interaction with mvMAPIT"
+author: "Jarkko Toivonen"
+format: html
+---
+
+## Quarto
+
+```{r setup}
+library(tidyverse)
+library(glue)
+#library(mvMAPIT)
+library(ggrepel)
+result_path <- "../results"
+```
+
+```{r}
+### Load in the R libraries for LT-MAPIT ###
+library(doParallel)
+library(Rcpp)
+library(RcppArmadillo)
+library(RcppParallel)
+library(CompQuadForm)
+library(truncnorm)
+use_openmp <- FALSE
+if (use_openmp) {
+  lt_mapit_path <- "~/progs/MAPIT-master/OpenMP Version"
+} else {
+  lt_mapit_path <- "~/progs/MAPIT-master/Standard Version"
+}
+### Load in functions to make QQ-plot plots ###
+# source("QQplot.R")
+
+#NOTE: This code assumes that the basic C++ functions are set up on the computer in use. If not, the MAPIT functions and Rcpp packages will not work properly. Mac users please refer to the homebrew applications and install the gcc commands listed in the README.md file before running the rest of the code [Warning: This step may take about an hour...].
+
+### Load in the C++ MAPIT wrapper functions ###
+if (use_openmp) {
+  source(file.path(lt_mapit_path, "MAPIT_OpenMP.R"))
+  sourceCpp(file.path(lt_mapit_path, "MAPIT_OpenMP.cpp"))
+} else {
+  source(file.path(lt_mapit_path, "MAPIT.R"))
+  sourceCpp(file.path(lt_mapit_path, "MAPIT.cpp"))
+}
+```
+
+```{r}
+L <- readRDS("../results/all_datas.rds")
+```
+
+
+```{r}
+covariate_names <- str_split_1("SEX_IMPUTED,AGE_AT_DEATH_OR_END_OF_FOLLOWUP,PC1,PC2,PC3,PC4,PC5,PC6,PC7,PC8,PC9,PC10,IS_FINNGEN2_CHIP,BATCH_DS1_BOTNIA_Dgi_norm,BATCH_DS10_FINRISK_Palotie_norm,BATCH_DS11_FINRISK_PredictCVD_COROGENE_Tarto_norm,BATCH_DS12_FINRISK_Summit_norm,BATCH_DS13_FINRISK_Bf_norm,BATCH_DS14_GENERISK_norm,BATCH_DS15_H2000_Broad_norm,BATCH_DS16_H2000_Fimm_norm,BATCH_DS17_H2000_Genmets_norm_relift,BATCH_DS18_MIGRAINE_1_norm_relift,BATCH_DS19_MIGRAINE_2_norm,BATCH_DS2_BOTNIA_T2dgo_norm,BATCH_DS20_SUPER_1_norm_relift,BATCH_DS21_SUPER_2_norm_relift,BATCH_DS22_TWINS_1_norm,BATCH_DS23_TWINS_2_norm_nosymmetric,BATCH_DS24_SUPER_3_norm,BATCH_DS25_BOTNIA_Regeneron_norm,BATCH_DS26_DIREVA_norm,BATCH_DS27_NFBC66_norm,BATCH_DS28_NFBC86_norm,BATCH_DS3_COROGENE_Sanger_norm,BATCH_DS4_FINRISK_Corogene_norm,BATCH_DS5_FINRISK_Engage_norm,BATCH_DS6_FINRISK_FR02_Broad_norm_relift,BATCH_DS7_FINRISK_FR12_norm,BATCH_DS8_FINRISK_Finpcga_norm,BATCH_DS9_FINRISK_Mrpred_norm", ",")
+covariate_names
+```
+
+```{r}
+covariate_filename <- "/finngen/library-red/finngen_R12/analysis_covariates/R12_COV_V2.FID.txt.gz"
+covariates <- read_tsv(covariate_filename, col_select = c("FID", all_of(covariate_names)))
+covariates <- covariates %>% rename(sample="FID")
+```
+
+```{r}
+filename <- file.path(result_path, "mapit_input.rds")
+if (! file.exists(filename)) {
+  set.seed(145)
+  tmp <- L$hc %>% 
+    select(sample, hemochromatosis) %>%
+    inner_join(covariates, by="sample")
+  cases <- tmp %>% filter(hemochromatosis == "case")
+  n_cases <- nrow(cases)
+  controls <- tmp %>% filter(hemochromatosis == "control") %>% # pick same number of controls as cases
+    slice_sample(n = n_cases)
+  all <- bind_rows(cases, controls)
+  saveRDS(all, filename)
+} else {
+  all <- readRDS(filename)
+}
+```
+
+Extract genotypes for these 1000 individuals for area 10Mbps around the hemochromatosis GWAS peak, roughly.
+It seems that MAPIT actually allows soft dosages so well use them instead of the below hard version.
+
+```{r}
+input_bgen <- "/finngen/library-red/finngen_R12/bgen_2.0/data/chrom/finngen_R12_6.bgen"
+output_dosages <- file.path(result_path, "dosages_for_mapit_soft.txt.gz")
+sample_file <- file.path(result_path, "samples_for_mapit.txt")
+#write_tsv(all %>% select(sample), sample_file, col_names = FALSE)
+#cmd <- glue("bgenix -g {input_bgen} -incl-range chr6:15000000-35000000 | qctool -g - -filetype bgen -threshold 0.9 -incl-samples {sample_file} -ofiletype dosage -og - | gzip > {output_dosages}")
+cmd <- glue("bgenix -g {input_bgen} -incl-range chr6:15000000-35000000 | qctool -g - -filetype bgen -incl-samples {sample_file} -ofiletype dosage -og - | gzip > {output_dosages}")
+print(cmd)
+# system(cmd)
+```
+
+LD prune variants.
+
+```{r}
+cmd <- glue("bgenix -g {input_bgen} -incl-range chr6:15000000-35000000 > /tmp/temp.bgen")
+print(cmd)
+system(cmd)
+```
+
+```{r}
+#output_filename <- file.path(result_path, "ld_pruned")
+output_filename <- "/tmp/ld_pruned"
+cmd <- glue("plink2 
+    --bgen /tmp/temp.bgen ref-first
+    --indep-pairwise 1500kb 1 0.2
+    --out {output_filename}") %>%
+    str_replace_all("\n", " ")
+print(cmd)
+system(cmd)
+```
+
+Read dosages.
+
+```{r}
+filename <- file.path(result_path, "dosages_for_mapit_soft.txt.gz")
+dosages <- read_delim(filename, delim=" ")
+```
+
+Prepare input for mvMAPIT.
+
+```{r}
+# X is pxn matrix of dosages, where p is the number of variants 
+X <- dosages %>%
+  head(100000) %>%   # Take this many variants
+  select(-c(chromosome, rsid, position, alleleA, alleleB)) %>% column_to_rownames("SNPID") %>% as.matrix()
+X <- X[,all$sample] # Make the order of columns the same as elsewhere
+# Y is 1xn matrix of traits
+Y <- all %>% 
+  select(sample, hemochromatosis) %>% 
+  mutate(hemochromatosis = as.integer(hemochromatosis == "case")) %>% 
+  column_to_rownames("sample") %>%
+  as.matrix() %>%
+  t()
+#Y <- matrix(as.integer(all$hemochromatosis == "case"), nrow = 1)
+# Z is qxn matrix of covariates, where q is the number of covariates
+# Keep only those BATCH variables with count at least 10
+keep_batches <- all %>% select(starts_with("BATCH")) %>% summarise(across(everything(), sum)) %>% unlist() %>% 
+  keep(function(x) x >= 10) %>% names()
+Z <- all %>% select(-hemochromatosis) %>% 
+  select(sample, PC1:PC10, SEX_IMPUTED, AGE_AT_DEATH_OR_END_OF_FOLLOWUP, IS_FINNGEN2_CHIP, all_of(keep_batches)) %>%
+  column_to_rownames("sample") %>% as.matrix() %>% t()
+dim(X)
+dim(Y)
+dim(Z)
+stopifnot(all(colnames(X) == colnames(Y)))  # Make sure the colnames agree
+stopifnot(all(colnames(Z) == colnames(Y)))
+```
+
+## Run mvMAPIT
+
+This runs mvMAPIT.
+
+```{r}
+res <- mvmapit(X, Y, Z)
+```
+
+## Run LT-MAPIT
+
+This runs LT-MAPIT. There are problems because the matrix X is not invertible.
+
+```{r}
+# The below period prevalence of hemochromaotis is from FinRegistry
+# https://risteys.finregistry.fi/endpoints/E4_IRON_MET
+#k <- 0.04  # Period prevalence
+k <- 0.5  # In my division
+if (use_openmp) {
+  cores <- 1
+  res <- MAPIT(X[1:100,], Y, hybrid=FALSE, test="davies", k=k, cores=cores)
+} else {
+  res <- MAPIT(X, Y, hybrid=FALSE, test="davies", k=k)
+}
+# mvMAPIT uses dataframes as results objects. Let's modify LT-MAPIT results to dataframes as well.
+res$pvalues <- res$pvalues %>%
+  enframe(name="id", value="p")
+res$pves <- tibble(PVE=res$pves) 
+```
+
+```{r}
+filename <- file.path(result_path, "mapit_result.rds")
+saveRDS(res, filename)
+```
+
+## Plot p-values
+
+These snips will be annotated.
+
+```{r}
+snips <- tribble(#~id, ~name, ~rsid, ~chr, ~pos, ~ref, ~alt,
+  ~SNPID, ~name, ~rsid, ~chromosome, ~position, ~first, ~second,
+  "chr6_26071867_A_C", "H1-2",      "rs9968910", 6, 26071867, "A", "C",
+  "chr6_26090951_C_G", "H63D",      "rs1799945", 6, 26090951, "C", "G",
+  "chr6_26090957_A_T", "S65C",      "rs1800730", 6, 26090957, "A", "T",
+  "chr6_26092913_G_A", "C282Y",     "rs1800562", 6, 26092913, "G", "A",
+  "chr6_32636375_A_G", "supersnip", "rs9272324", 6, 32636375, "A", "G")
+snips
+```
+
+```{r}
+tmp <- res$pvalues %>%
+  #enframe(name="id", value="p") %>%  # For LT-MAPIT
+  separate(id, c("chr", "pos", "ref", "alt"), sep="_") %>%
+  mutate(pos = as.integer(pos),
+         mlogp = - log10(p))
+annotate <- tmp %>% filter(pos %in% snips$position)
+annotate <- tmp %>% inner_join(snips, by=c(pos="position"))
+tmp %>%
+  ggplot(aes(pos, mlogp)) +
+  geom_point() + 
+  geom_point(data = annotate, mapping=aes(), color="red") + 
+  geom_text_repel(data = annotate, mapping=aes(label = name), color="red") + 
+  labs(x="Position", y=expr(-log[10]("p")), title="Chromosome 6") +
+  scale_x_continuous(#labels = scales::label_comma(),
+                     labels = scales::label_number(scale_cut = scales::cut_short_scale(), suffix="bp")) +
+  #scale_y_continuous(expand = expansion(add = 10))
+  lims(y=c(0, 20))
+```
+
+```{r}
+res$pvalues %>% ggplot(aes(p)) + geom_histogram() + labs(x="P-value")
+```
+
+Lots of near-zero p-values!
+
+```{r}
+myqq <- function(pvalues) {
+  o <- -log10(sort(pvalues, decreasing=F))
+  e <- -log10((1:length(o))/length(o))
+  tibble(observed=o, expected=e)
+}
+tmp <- myqq(res$pvalues$p)
+tmp %>% filter(is.finite(observed)) %>%
+  ggplot(aes(observed, expected)) + 
+  geom_abline(intercept=0, slope=1, color="red") +
+  geom_point() +
+  labs(x=expr("Observed"-log[10]("p")), expr("Expected"-log[10]("p")))
+```
+
+```{r}
+### NOTE: The first set of p-values will be deflated (as mentioned in Crawford and Zhou (2018)). To fix this issues we next run the test statistic readjustment procedure ###
+readjust_pvalues <- function(pvals) {
+  pvals <- pvals[pvals > 0]
+  #pvals = davies.pvals[davies.pvals>=0]; summary(pvals)
+  q = qchisq(pvals,df=1,lower.tail = FALSE)
+  gs = median(q); m = 0.4549
+  pvals = pchisq((q/gs)*m,df=1,lower.tail = FALSE)
+  pvals
+}
+```
+
+```{r}
+res$pvalues$p %>% 
+  discard(is.na) %>%
+  readjust_pvalues() %>%
+  myqq() %>%
+  ggplot(aes(observed, expected)) + 
+  geom_abline(intercept=0, slope=1, color="red") +
+  geom_point() +
+  labs(x=expr("Observed"-log[10]("p")), y=expr("Expected"-log[10]("p")), title="Readjusted")
+```
+
+## Phenotypic variance explained
+
+```{r}
+res$pves %>% ggplot(aes(PVE)) + geom_histogram() + scale_y_log10() + 
+  labs(x="Phenotypic variance explained")
+```
+
+
+
+
+
+
+
+
+
+
+

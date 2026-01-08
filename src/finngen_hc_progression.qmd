@@ -1,0 +1,2146 @@
+---
+title: "FinnGen HC progression"
+author: "Jarkko Toivonen"
+date: "`r Sys.Date()`"
+format: 
+  html:
+    df-print: kable
+    toc: true
+    toc-depth: 4
+    embed-resources: true
+---
+
+## todo
+
+Talleta bigquery-kyselyn tulokset, ettei tarvi joka kerta ajaa.
+
+## Setup
+
+```{r setup}
+library(countreg)
+library(topmodels)
+library(tidyverse)
+library(broom)
+library(glue)
+library(pscl)  # For zero-inflated models
+library(patchwork)
+library(performance)
+library(exclude)
+library(UpSetR)
+library(bigrquery)
+library(statmod)  # For qresid
+library(ggvenn)
+library(tictoc)
+
+# This can measure time a chunk took to execute.
+# Add chunk option time_it=TRUE to each chunk your want to measure.
+knitr::knit_hooks$set(time_it = local({
+  now <- NULL
+  function(before, options) {
+    if (before) {
+      # record the current time before each chunk
+      now <<- lubridate::now()
+    } else {
+      # calculate the time difference after a chunk
+      res <- lubridate::now() - now
+      # return a character string to show the time
+      msg <- sprintf("Time for this code chunk to run: %.2f %s", as.numeric(res), units(res))
+      message(msg)
+      NULL   # Don't return the message so that it won't be printed to the resulting document.
+      msg
+    }
+  }
+}))
+knitr::opts_chunk$set(echo=TRUE, time_it=TRUE)
+
+source("common.R")
+
+allow_individual_level_data <- TRUE
+recompute <- FALSE
+save_figs <- FALSE
+save_tables <- FALSE
+
+release <- "r12"; Release <- str_to_upper(release)
+
+result_path <- file.path("../results", release, "progression")
+
+#result_path <- "../results/progression"
+table_path  <- file.path(result_path, "tables")
+figure_path <- file.path(result_path, "figures")
+model_path <- file.path(result_path, "models")
+
+c(figure_path, table_path, model_path) %>% purrr::discard(dir.exists) %>% walk(~dir.create(., recursive = TRUE))  # Create dirs if they don't exist
+```
+
+## Functions
+
+Some levels combinations in interactions are missing. Hence, I need to convert to model.matrix and then preprocess the data to
+exclude constant columns.
+
+I also drop the interaction C282Y1:donations_in_five_years, since it gets huge std error in all models.
+
+```{r}
+use_expanded_matrix <- TRUE  # Let's encode the covariates explicitly
+responses <- c("n", "n_all", "n_window", "n_full_window")
+my_expand <- function(f, data) {
+  m <- model.matrix(as.formula(f), data = data)
+  non_constant_cols <- m %>% apply(2, sd) %>% keep(~ . != 0) %>% names()       # Drop constant columns
+  covariates <- setdiff(non_constant_cols, "donations_in_five_years:C282Y1")   # this causes huge std err
+  m <- cbind(m[, covariates], data %>% select(any_of(responses))) %>% as_tibble()
+  m
+}
+```
+
+```{r}
+# Compute qqplot of a count model.
+# The fitted model must have name fit_{name}
+get_qqplot <- function(name, data) {
+  model <- get(sprintf("fit_%s", name), rlang::global_env())
+  df <- qqrplot(model, newdata = data, plot=FALSE, simint = TRUE, confint = TRUE)
+  autoplot(df, main = name)
+}
+```
+
+```{r}
+get_rootogram <- function(name, data) {
+  model <- get(sprintf("fit_%s", name), rlang::global_env())
+  tryCatch({
+    df <- rootogram(model, newdata = data, plot=FALSE, confint = TRUE)
+    autoplot(df, main = name)
+  }, error = function(e) {  # Some models did not fit. Hence rootogram fails as well
+    NULL
+  })
+}
+```
+
+
+## Load datas
+
+### Primary health care hemochromatosis
+
+```{r}
+if (recompute) {
+  # Running some authentication code:
+  projectid <- "fg-production-sandbox-5" # NB: ADD YOUR SANDBOX NUMBER!
+  options(gargle_oauth_cache = FALSE)
+  bq_auth(scopes = "https://www.googleapis.com/auth/bigquery")
+  
+  # Making a connection object that is used to connect to the tables:
+  con = dbConnect(
+    bigrquery::bigquery(),
+    project = "finngen-production-library",
+    dataset = if (release == "r12") "sandbox_tools_r12" else "sandbox_tools_r13",
+    billing = projectid
+  )
+  
+  dbListTables(con)           # List available tables
+  
+  if (release == "r12") {
+    detailed = tbl(con, "finngen_r12_service_sector_detailed_longitudinal_v1")
+  } else {
+    detailed = tbl(con, "finngen_r13_service_sector_detailed_longitudinal_v1")
+  }
+}
+```
+
+```{r}
+icd9_hc = c("2750", "2750A")
+icd10_hc <- c("E831")
+filename <- file.path(table_path, "prim_out_hemochromatosis_individuals.txt")
+if (recompute || ! file.exists(filename)) {
+  prim_out_case_df <- detailed %>%
+    select(FINNGENID:CODE2, ICDVER, CATEGORY) %>%  # selecting only columns we need
+    filter(                                        # filtering row conditions that define our cases
+      (SOURCE %in% c("PRIM_OUT") & (
+        (ICDVER == "10" & (CODE1 == icd10_hc | CODE2 == icd10_hc)) |
+          (ICDVER == "9" &  (CODE1 %in% icd9_hc |  CODE2 %in% icd9_hc))
+      ))
+    ) %>%
+    collect()
+  prim_out_hemochromatosis_individuals <- prim_out_case_df %>% pull(FINNGENID) %>% unique()
+  write_lines(prim_out_hemochromatosis_individuals, filename)
+} else {
+  prim_out_hemochromatosis_individuals <- read_lines(filename)
+}
+```
+
+### Related diseases
+
+```{bash, eval=FALSE}
+filename=/finngen/library-red/finngen_R12/endpoint_cohorts_v1.0/endpoint_cohorts_r12_v1.csv.gz
+output=../results/progression/exclusion_diagnoses.tsv.gz
+if [[ ! -f $output ]] ; then
+  time zcat $filename | awk 'NR==1;NR>1{if ($3 == 1 && ($2 == "POLYCYTVERA" || $2 == "D3_SCNDPOLYCYTHAEMIA" || $2 == "E4_PORCUTTAR")) print}' | gzip > $output 
+fi
+```
+
+This took 28 minutes. In the future, do this with bigquery!
+
+```{r}
+filename <- file.path(result_path, "exclusion_diagnoses.tsv.gz")
+if (recompute || ! file.exists(filename)) {
+  if (release == "r12") {
+    endpoint_cohorts = tbl(con, "endpoint_cohorts_r12_v1")
+  } else {
+    endpoint_cohorts = tbl(con, "endpoint_cohorts_r13_v3")
+  }
+  exclusion_diagnoses <- endpoint_cohorts %>% 
+    filter(CONTROL_CASE_EXCL == 1 & (ENDPOINT %in% c("POLYCYTVERA", "D3_SCNDPOLYCYTHAEMIA"))) %>%
+    rename(sample=FINNGENID) %>%
+    collect()
+  write_tsv(exclusion_diagnoses, filename)
+} else {
+  exclusion_diagnoses <- read_tsv(filename, show_col_types = FALSE) %>% rename(any_of(c(sample="FINNGENID")))
+}
+```
+
+```{r}
+polycythemia_individuals <- exclusion_diagnoses %>% filter(ENDPOINT == "POLYCYTVERA") %>% pull(sample) %>% unique() 
+secondary_polycythemia_individuals <- exclusion_diagnoses %>% filter(ENDPOINT == "D3_SCNDPOLYCYTHAEMIA") %>% pull(sample) %>% unique() 
+porphyria_individuals    <- exclusion_diagnoses %>% filter(ENDPOINT == "E4_PORCUTTAR") %>% pull(sample) %>% unique() 
+sprintf("There are %i individuals with polycythemia, %i individuals with secondary polycythemia and %i individuals with porphyria\n", 
+        length(polycythemia_individuals), length(secondary_polycythemia_individuals), length(porphyria_individuals))
+```
+
+### End of followup age and date
+
+Get end of followup age and date.
+
+```{r}
+if (release == "r12") {
+  filename <- "/finngen/library-red/finngen_R12/analysis_covariates/R12_COV_V2.FID.txt.gz"
+} else {
+  filename <- "/finngen/library-red/finngen_R13/analysis_covariates/data/R13_COV_V0.FID.txt.gz"
+}
+eof_orig <- read_tsv(filename, col_select = c("FID", "APPROX_BIRTH_DATE", 
+                                         "AGE_AT_DEATH_OR_END_OF_FOLLOWUP")) %>%
+  rename(sample=FID, eof_age = AGE_AT_DEATH_OR_END_OF_FOLLOWUP) %>%
+  mutate(eof_date = APPROX_BIRTH_DATE + 365*eof_age)
+eof <- eof_orig %>% select(sample, eof_age)
+eof_date <- eof_orig %>% select(sample, eof_date)
+```
+
+### Venesections
+
+What codes are used for phlebotomy and venesection?
+
+```{bash}
+grep -Ei "FG_CODE1|phlebotomy|venesection" /finngen/library-green/medical_codes/fg_codes_info_v7/fg_codes_info.csv > /tmp/procedures.tsv
+```
+
+```{r}
+procedure_codes <- read_tsv("/tmp/procedures.tsv", show_col_types = FALSE)
+procedure_codes %>% select(-c(FG_CODE2:FG_CODE9, extra_info)) # Drop the NA columns
+```
+
+
+
+```{r}
+# Read from the main results directory
+venesections <- read_tsv(file.path("../results", release, "venesections.tsv.gz"))
+venesections <- venesections %>% 
+  mutate(operation = if_else(CODE1=="TPH00", "Phlebotomy", "Venesection")) %>%
+  rename(sample = FINNGENID)
+if (allow_individual_level_data) {
+  venesections %>% select(-sample) %>% head()
+}
+venesections <- venesections %>% 
+  mutate(CATEGORY = fct_relabel(CATEGORY, ~ str_sort(., numeric = TRUE)))
+venesections %>% select(-sample) %>% mutate(across(where(is.character), as.factor)) %>% summary()
+```
+
+
+
+```{r}
+if (allow_individual_level_data) {
+  venesections %>% 
+  select(CATEGORY) %>% table()
+}
+```
+
+```{r}
+if (allow_individual_level_data) {
+  venesections %>% select(CODE1, CATEGORY) %>% table()
+}
+```
+
+The SPAT1074 codes are solely from the primary health care.
+
+```{r}
+if (allow_individual_level_data) {
+  venesections %>% select(SOURCE, CATEGORY) %>% table()
+}
+```
+
+```{r}
+venesections %>% select(CODE1, SOURCE) %>% table()
+```
+
+```{r}
+g1 <- venesections %>% ggplot(aes(EVENT_AGE, fill=operation)) + geom_histogram(alpha=0.5,
+                 position="identity")
+breaks <- venesections %>% 
+  group_by(operation) %>% 
+  cut_helper_variable_width("EVENT_AGE") %>% 
+  pluck("breaks")
+g2 <- venesections %>% ggplot(aes(EVENT_AGE, fill=operation)) + 
+  geom_histogram(alpha=0.5,
+                 position="identity",
+                 breaks=breaks) +
+  labs(subtitle="Variable-width histogram") + 
+  lims(x=c(0,100))
+min_bin_size(g2)
+g1 + g2 + plot_layout(guides = "collect") & theme(legend.position = 'bottom')
+```
+
+```{r}
+#venesections %>% ggplot(aes(APPROX_EVENT_DAY, color=operation)) + geom_freqpoly()
+breaks <- venesections %>% 
+  group_by(operation) %>% 
+  cut_helper_variable_width("APPROX_EVENT_DAY") %>% 
+  pluck("breaks")
+g <- venesections %>% ggplot(aes(APPROX_EVENT_DAY, fill=operation)) + 
+  geom_histogram(alpha=0.5,
+                 position="identity",
+                 breaks=breaks) +
+  labs(subtitle="Variable-width histogram")
+min_bin_size(g)
+g
+```
+
+
+Get train ids.
+
+```{r}
+filename <- file.path("../results", release, "training_sample_ids.tsv.gz")
+#filename <- file.path(result_path, "training_sample_ids.tsv.gz")
+training_ids <- read_tsv(filename)
+training_ids <- training_ids %>% rename(sample = FID)
+```
+
+Read hemochromatosis status.
+
+```{r}
+filename <- file.path("../results", release, "hemochromatosis_full.rds")
+#filename <- file.path(result_path, "hemochromatosis_full.rds")
+hc_full <- readRDS(filename)
+hc <- hc_full %>% select(sample, hemochromatosis)
+hc_count <- hc %>% count(hemochromatosis)
+hc_ids <- hc %>% filter(hemochromatosis == "case") %>% pull(sample)
+```
+
+Upsetplot.
+
+```{r}
+all_venesection_ids <- unique(venesections$sample)   # This contains both venesections and phlebotomies
+real_venesection_ids <- venesections %>% filter(operation == "Venesection") %>% pull(sample) %>% unique()
+phlebotomy_ids <- venesections %>% filter(operation == "Phlebotomy") %>% pull(sample) %>% unique()
+people <- list(hemochromatosis = hc_ids, 
+               extra_hc = setdiff(prim_out_hemochromatosis_individuals, hc_ids),
+               venesection = all_venesection_ids, 
+               #venesection = real_venesection_ids, 
+               #phlebotomy = phlebotomy_ids,
+               polycythemia = polycythemia_individuals,
+               secondary_polycythemia = secondary_polycythemia_individuals,
+               porphyria = porphyria_individuals)
+#
+#png(filename, width = 180/25.4)
+u <- UpSetR::upset(UpSetR::fromList(people),#, order.by = "freq", 
+                       set_size.show=TRUE,
+                  nsets = 7,
+                  nintersects = if (allow_individual_level_data) 40 else 16,
+                  order.by = "freq",
+                       #empty.intersections = TRUE,
+                       set_size.scale_max = 1400, # This doesn't help to explain where donors from eProgesa disappear
+                       #nintersects = NA   # Show all intersections. Does not work. Six seems to be the maximum
+                       # number of intersections
+                       )
+if (save_figs) {
+  filename <- file.path(figure_path, "venesection_upset.pdf")
+  pdf(filename, width = 180/25.4, height=90/25.4)
+  print(u)
+  invisible(dev.off())
+}
+grid::grid.newpage()
+print(u, newpage = FALSE)
+```
+
+Very few of the venesections are explained by the extra hemochromatosis cases from primary health care.
+
+```{r}
+venesections <- venesections %>% inner_join(hc, by="sample")
+```
+
+## Venesection statistics
+
+Get the number of operations and individuals involved.
+
+```{r}
+helper <- function(df, operation_type) {
+  tmp <- df %>% filter(operation == operation_type)
+  tibble(operation=operation_type, operations=nrow(tmp), individuals=n_distinct(tmp$sample))
+}
+```
+
+```{r}
+map(c("Venesection", "Phlebotomy"), ~ helper(venesections, .)) %>% bind_rows()
+```
+
+Statistics stratified by hemochromatosis status.
+
+
+```{r}
+get_statistics <- function(venesections, variables=c("operation", "hemochromatosis")) {
+  tmp1 <- venesections %>% select(sample, all_of(variables)) %>% count(across(all_of(variables)), name="operations")
+  tmp2 <- venesections %>% select(sample, all_of(variables)) %>% distinct() %>% count(across(all_of(variables)), name="treated")
+  tmp <- tmp1 %>%
+    inner_join(tmp2, by=variables) %>%
+    inner_join(hc_count, by="hemochromatosis") %>%
+    mutate(operations_per_treated = operations / treated,
+           treated_fraction = treated / n)
+  tmp
+}
+```
+
+```{r}
+df <- get_statistics(venesections)
+df
+```
+
+```{r}
+filename <- file.path(table_path, "venesection_statistics.tsv")
+if (save_tables)
+  write_tsv(df, filename)
+```
+
+
+Check the statistics again. This time unstratified.
+
+```{r}
+get_statistics(venesections, "hemochromatosis")
+```
+
+## Visualize venesections
+
+When the venesections occur?
+
+```{r}
+venesections_extra <- venesections %>% 
+  group_by(sample) %>% 
+  mutate(n = n(),
+         days = as.numeric(max(APPROX_EVENT_DAY) - min(APPROX_EVENT_DAY)),
+         years = days / 365,
+         diff = c(NA, diff(APPROX_EVENT_DAY)),
+         switch = as.integer(diff >= 365) %>% replace_na(0), # New treatment series begins?
+         series = 1 + cumsum(switch)) %>%   
+  ungroup()
+```
+
+```{r}
+venesections_extra %>% 
+  ggplot(aes(APPROX_EVENT_DAY)) +
+  geom_histogram()
+```
+
+Distribution of treatment series.
+
+```{r}
+venesections_extra %>% 
+  group_by(sample, hemochromatosis) %>% summarise(number_of_series = max(series), .groups = "drop") %>%
+  mutate(number_of_series = factor(number_of_series)) %>%
+  ggplot(aes(number_of_series)) + geom_bar() + facet_wrap(~ hemochromatosis)
+```
+
+```{r}
+g1 <- venesections_extra %>% filter(hemochromatosis == "case") %>%
+  ggplot(aes(x = EVENT_AGE, y = sample, color = operation)) +
+  geom_point() + labs(title = "Case") +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+g2 <- venesections_extra %>% filter(hemochromatosis == "control") %>%
+  ggplot(aes(x = EVENT_AGE, y = sample, color = operation)) +
+  geom_point() + labs(title = "Control") +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+g1 + g2 + plot_layout(guides = "collect") & theme(legend.position = 'bottom')
+```
+
+Long careers:
+
+```{r}
+venesections_extra %>% filter(years >= 1, hemochromatosis == "case") %>%
+  ggplot(aes(x = EVENT_AGE, y = sample, color = operation)) +
+  geom_point() + labs(title = "Case") +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+```
+
+New treatment series is defined here to start after a one year break.
+
+```{r}
+venesections_extra %>% filter(years >= 1, hemochromatosis == "case") %>%
+  mutate(series = as.factor(series)) %>%
+  ggplot(aes(x = EVENT_AGE, y = sample, color = series)) +
+  geom_point() + labs(title = "Case") +
+  labs(color = "Treatment series") +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+```
+
+
+
+
+Below, colored circle denotes the HC diagnosis and hollow black circle denotes end of followup.
+
+```{r}
+#| fig-width: 5
+#| fig-height: 30
+tmp <- venesections_extra %>% 
+  filter(hemochromatosis == "case", n >= 4) %>%
+  left_join(hc_full %>% select(sample, sex, diagnosis_date = approx_event_date, diagnosis_age = age), by="sample") %>%
+  left_join(eof, by="sample") %>%
+  mutate(sample = fct_reorder(sample, diagnosis_age))
+n <- n_distinct(tmp$sample)
+tmp %>%
+  ggplot(aes(EVENT_AGE, sample)) + 
+  geom_point(aes(x = diagnosis_age, color = sex)) +
+  geom_point(aes(x = eof_age), color="black", shape=21) +
+  geom_violin(scale = "count", position = "identity", width = 25) + 
+  coord_cartesian(y=c(0, n+1)) +
+  labs(title = sprintf("%i cases with venesections", n)) +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank()) +
+  NULL
+```
+
+
+```{r}
+#| fig-width: 5
+#| fig-height: 6
+n <- 10
+controls <- venesections_extra %>% 
+  filter(hemochromatosis == "control", n >= 2) %>% pull(sample) %>% unique() %>% sample(10)
+tmp <- venesections_extra %>% 
+  #filter(hemochromatosis == "control", n >= 4) %>%
+  filter(sample %in% controls) %>%
+  #left_join(hc_full %>% select(sample, sex, diagnosis_date = approx_event_date, diagnosis_age = age), by="sample") %>%
+  left_join(eof, by="sample") %>%
+  mutate(sample = fct_reorder(sample, eof_age))
+#limits <- unique(tmp$sample)
+#n <- n_distinct(tmp$sample)
+tmp %>%
+  ggplot(aes(EVENT_AGE, sample)) + 
+  #geom_histogram()
+  #geom_point(aes(x = diagnosis_age, color = sex)) +
+  geom_point(aes(x = eof_age), color="black", shape=21) +
+  geom_violin(scale = "count", position = "identity", width = 20) + 
+  #geom_violin(scale = "count", position = "identity") + 
+  #scale_y_discrete(expand = expansion(add = -8)) + #, limits=limits) +
+  coord_cartesian(y=c(0, n+1)) +
+  #lims(y=c(1, n)) +
+  #geom_violin(scale = "area") +
+  labs(title = sprintf("Controls, sample of %i individuals", n)) +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank()) +
+  NULL
+```
+
+Are there some people who have gotten both venesections and phlebotomies.
+
+```{r}
+setlist <- list(venesections = venesections %>% filter(operation == "Venesection") %>% pull(sample) %>% unique(),
+                phlebotomy = venesections %>% filter(operation == "Phlebotomy") %>% pull(sample) %>% unique())
+ggvenn(setlist)
+```
+
+Distribution of treatment lengths.
+
+```{r}
+venesections_extra %>% select(sample, years, hemochromatosis) %>% distinct() %>% ggplot(aes(years)) + geom_histogram() +
+  facet_wrap(~ hemochromatosis)
+```
+
+
+## Form data
+
+Compute the combined number of operations. Take only the venesections from the first two years.
+
+```{r}
+tmp <- venesections %>% 
+  left_join(hc_full %>% select(sample, sex, diagnosis_date = approx_event_date, diagnosis_age = age), by="sample") %>%
+  group_by(sample) %>%
+  mutate(first_venesection_date = min(APPROX_EVENT_DAY)) %>%
+  ungroup()
+tmp1 <- tmp %>%
+  count(sample, hemochromatosis, first_venesection_date, name = "n_all") 
+tmp2 <- tmp %>%
+  #filter(hemochromatosis == "case") %>%
+  filter(first_venesection_date <= APPROX_EVENT_DAY, APPROX_EVENT_DAY <= first_venesection_date + years(2)) %>% 
+  count(sample, hemochromatosis, first_venesection_date, name = "n_window")  # Window might be less than two years of length
+tmp3 <- tmp %>%
+  filter(first_venesection_date <= APPROX_EVENT_DAY, APPROX_EVENT_DAY <= first_venesection_date + years(2)) %>% 
+  count(sample, hemochromatosis, first_venesection_date, name = "n_full_window") %>% # Exactly two-year window
+  left_join(eof_date, by="sample") %>%
+  mutate(diff = eof_date - first_venesection_date) %>% 
+  mutate(n_full_window = if_else(diff < 2*365, -n_full_window, n_full_window))
+venesection_counts <- hc %>% 
+  left_join(tmp1, by = c("sample", "hemochromatosis")) %>%
+  left_join(tmp2, by = c("sample", "hemochromatosis", "first_venesection_date")) %>%
+  left_join(tmp3, by = c("sample", "hemochromatosis", "first_venesection_date")) %>%
+  replace_na(list(n_all = 0, n_window = 0)) %>%
+  mutate(n = n_all) %>%
+  select(-c(eof_date, diff))
+  #mutate(n = replace_na(n, 0))
+rm(tmp, tmp1, tmp2, tmp3)
+```
+
+
+
+
+```{r}
+filename <- file.path("../results", release, "basic.rds")
+basic <- readRDS(filename)
+```
+
+Combined the datas.
+
+```{r}
+combined <- inner_join(
+  venesection_counts, 
+  basic %>% select(-starts_with("int")), 
+  by=c("sample", "hemochromatosis"))
+```
+
+Take all individuals in the training set.
+
+```{r}
+train_data2 <- combined %>% semi_join(training_ids)
+```
+
+
+
+```{r}
+g <- train_data2 %>%
+  #filter(n <= 10) %>%
+  ggplot(aes(n)) +
+  #geom_density() +
+  geom_bar() +
+  facet_grid(hemochromatosis ~ ., scales="free") +
+  #scale_x_log10() +
+  scale_y_log10() +
+  labs(x="Number of operations")
+min_bin_size(g)
+g
+```
+
+### Exclude individuals with certain diagnoses.
+
+
+Do the exclusion.
+
+```{r}
+helper <- function(df, x) { df %>% filter(hemochromatosis==x) %>% pull(n) %>% sum() }
+statistics <- function(df) list(cases=sum(df$hemochromatosis=="case"), controls=sum(df$hemochromatosis=="control"),
+                                case_donations=helper(df, "case"), control_donations=helper(df, "control"))
+```
+
+#### Train data
+
+```{r}
+filename <- file.path(result_path, "train_data.rds")
+exclusions_filename <- file.path(table_path, "train_exclusions.tsv")
+if (! file.exists(filename) || recompute) {
+  train_data <- train_data2 %>%
+    init_exclude(statistics=statistics) %>%
+    filter(! sample %in% polycythemia_individuals) %>%
+    exclude("Polycythemia") %>%
+    filter(! sample %in% porphyria_individuals) %>%
+    exclude("Porphuria cutanea tarda")
+  saveRDS(train_data, filename)
+  # Save exclusion tibble to file
+  e <- get_exclude()
+  train_exclusions <- as_tibble(e)
+  write_tsv(train_exclusions, exclusions_filename)
+} else {
+  train_data <- readRDS(filename)
+  train_exclusions <- read_tsv(exclusions_filename)
+}
+```
+
+
+```{r}
+rm(train_data2)
+```
+
+```{r}
+train_exclusions %>%
+  exclude::plot_flow() %>% 
+  DiagrammeR::grViz()
+```
+
+#### Full data
+
+```{r}
+filename <- file.path(result_path, "full_data.rds")
+exclusions_filename <- file.path(table_path, "full_exclusions.tsv")
+if (! file.exists(filename) || recompute) {
+  full_data <- combined %>%
+    init_exclude(statistics=statistics) %>%
+    filter(! sample %in% polycythemia_individuals) %>%
+    exclude("Polycythemia") %>%
+    filter(! sample %in% porphyria_individuals) %>%
+    exclude("Porphuria cutanea tarda")
+  saveRDS(full_data, filename)
+  # Save exclusion tibble to file
+  e <- get_exclude()
+  full_exclusions <- as_tibble(e)
+  write_tsv(full_exclusions, exclusions_filename)
+} else {
+  full_data <- readRDS(filename)
+  full_exclusions <- read_tsv(exclusions_filename)
+}
+if (save_figs) {
+  filename <- file.path(figure_path, "full_exclusions.dot")
+  full_exclusions %>%
+    exclude::plot_flow() %>%
+    cat(file = filename)
+}
+
+```
+
+```{r}
+rm(combined)
+```
+
+```{r}
+full_exclusions %>%
+  exclude::plot_flow() %>% 
+  DiagrammeR::grViz()
+```
+
+```{r}
+sprintf("Train data has %i individuals\n", nrow(train_data)) %>% cat()
+sprintf("Full data has %i individuals\n", nrow(full_data)) %>% cat()
+```
+
+
+### Check the counts again.
+
+```{r}
+train_data %>%
+  #filter(n <= 10) %>%
+  ggplot(aes(n)) +
+  #geom_density() +
+  geom_bar() +
+  geom_text(data = train_data %>% count(hemochromatosis), mapping = aes(x = I(0.5), y = I(0.5), label=sprintf("n=%i", n))) +
+  facet_grid(hemochromatosis ~ ., scales="free") +
+  #scale_x_log10() +
+  scale_y_log10() +
+  labs(x="Number of operations", y="Number of individuals")
+```
+
+```{r}
+cases <- train_data %>% filter(hemochromatosis == "case") %>% select(-hemochromatosis)
+n <- nrow(train_data)   # Number of individuals
+```
+
+```{r}
+cases %>% 
+  ggplot(aes(n, fill=sex2)) +
+  geom_bar(position="dodge") +
+  #scale_y_log10() +
+  labs(x="Number of operations", title="Number of venesections in hemochromatosis cases",
+       subtitle = sprintf("%i cases", nrow(cases))) +
+  theme(legend.position = "bottom")
+```
+
+One of the outliers got removed after filtering out individual with other diseases for which phlebotomy is a treatment.
+
+### Data with exposure
+
+Take only venesections after the first hemochromatosis diagnosis.
+
+```{r}
+helper <- function(df, x) { df %>% filter(hemochromatosis==x) %>% pull(n) %>% sum() }
+helper2 <- function(df, x) { df %>% filter(hemochromatosis==x) %>% pull(sample) %>% n_distinct() }
+statistics <- function(df) list(venesections = sum(! is.na(df$venesection_date)),
+                                cases = helper2(df, "case"), 
+                                controls = helper2(df, "control"))
+```
+
+```{r}
+combined_with_exposure <- hc_full %>% 
+  left_join(eof_date, by="sample") %>% 
+  select(sample, hemochromatosis, sex, diagnosis_date = approx_event_date, diagnosis_age = age, eof_date) %>%
+  left_join(venesections %>% rename(venesection_age = EVENT_AGE, venesection_date = APPROX_EVENT_DAY) %>% select(-c(CODE2:CODE4, ICDVER, INDEX)), 
+             by=c("sample", "hemochromatosis")) %>%
+  #left_join(basic %>% select(-starts_with("int")), by=c("sample", "hemochromatosis")) %>%
+  mutate(exposure = as.numeric((eof_date - diagnosis_date) / 365)) %>%
+  init_exclude(statistics=statistics) %>%
+  filter(hemochromatosis == "case") %>% 
+  exclude("Controls") %>%
+  filter(is.na(venesection_date) | (venesection_date >= diagnosis_date)) %>%
+  exclude("Drop venesections before diagnosis") %>%
+  filter(! sample %in% polycythemia_individuals) %>%
+  exclude("Polycythemia") %>%
+  filter(! sample %in% porphyria_individuals) %>%
+  exclude("Porphuria cutanea tarda") %>%
+  filter(diagnosis_date <= eof_date) %>%
+  exclude("Diagnosis after EOF") %>%
+  nest(venesection_df = c(SOURCE, venesection_age, venesection_date, CODE1, CATEGORY, operation)) %>%
+  mutate(n = map_int(venesection_df, function(df) { sum(! is.na(df$venesection_date)) } )) %>%
+  select(- venesection_df) %>%
+  left_join(basic %>% select(-starts_with("int")), by=c("sample", "hemochromatosis", "sex"))
+  #count(sample, hemochromatosis, exposure, name = "n")
+```
+
+For some reason, some people have HC diagnosis after end of follow-up.
+
+Save and plot exclusions.
+
+```{r}
+# Save exclusion tibble to file
+e <- get_exclude()
+full_exposure_exclusions <- as_tibble(e)
+if (save_tables) {
+  exclusions_filename <- file.path(table_path, "full_exposure_exclusions.tsv")
+  write_tsv(full_exclusions, exclusions_filename)
+}
+if (save_figs) {
+  filename <- file.path(figure_path, "full_exposure_exclusions.dot")
+  full_exposure_exclusions %>%
+    exclude::plot_flow() %>%
+    cat(file = filename)
+  filename <- file.path(figure_path, "full_exposure_exclusions.svg")
+  #plot(e) %>%
+  full_exposure_exclusions %>%
+    exclude::plot_flow() %>% 
+    DiagrammeR::grViz() %>%
+    DiagrammeRsvg::export_svg() %>% 
+    cat(file = filename)
+}
+
+full_exposure_exclusions %>%
+  exclude::plot_flow() %>% 
+  DiagrammeR::grViz()
+```
+
+```{r, eval=FALSE}
+r"(digraph graphname {node [shape="box"];labeljust = l P1 [label = "Original data\lvenesections=7,104\lcases=477\l"]})" %>%
+  #cat() %>%
+  DiagrammeR::grViz()
+```
+
+```{r}
+g1 <- combined_with_exposure %>% ggplot(aes(n)) + geom_bar() + labs(x="Number of venesections")
+```
+
+```{r}
+g2 <- combined_with_exposure %>% pivot_longer(cols=c(diagnosis_age, exposure)) %>% ggplot(aes(value)) + geom_histogram() + 
+  facet_wrap(~name, scales="free", labeller = as_labeller(c(diagnosis_age = "HC diagnosis age", exposure="Exposure to venesections in years")))
+#labs(x="Exposure to venesections in years")
+```
+
+```{r}
+g3 <- combined_with_exposure %>% ggplot(aes(diagnosis_date)) + geom_histogram()
+```
+
+```{r}
+g1 + g3 / g2 + plot_annotation(title = "Exposure model data", 
+                               subtitle = glue("{nrow(combined_with_exposure)} hemochromatosis patients, {sum(combined_with_exposure$n)} venesections"))
+```
+
+## Who are the outliers?
+
+No outliers visible anymore.
+
+```{r, eval=FALSE}
+outliers <- cases %>% filter(sex2 == "pre") %>% filter(n > 50)
+#View(outliers)
+outlier_ids <- outliers %>% pull(sample)
+```
+
+```{r, eval=FALSE}
+conv <- set_names(outlier_ids, paste0("pseudonym", 1))
+outlier_venesections <- venesections %>% 
+  filter(sample %in% outlier_ids) %>%
+  mutate(sample = fct_recode(sample, !!!conv))
+outlier_venesections %>%
+  ggplot(aes(x=EVENT_AGE, y=1)) + geom_point() + 
+  facet_grid(sample ~ ., scales = "free")
+  #ggh4x::facet_grid2(sample ~ ., scales = "free", independent=TRUE)
+outlier_venesections %>%
+  ggplot(aes(x=APPROX_EVENT_DAY, y=1)) + geom_point() + 
+  facet_grid(sample ~ ., scales = "free")
+```
+
+They are not relatives and they are not born in the same place.
+
+
+#### Pedigree.
+
+No outliers anymore.
+
+```{r, eval=FALSE}
+filename <- "/finngen/library-red/finngen_R12/kinship_1.0/data/finngen_R12_pedigree.fam"
+cmd <- glue('grep -E "{conv["pseudonym1"]}" {filename}')
+#print(cmd)
+system(cmd)
+```
+
+
+
+```{r, eval=FALSE}
+filename <- "/finngen/library-red/finngen_R12/kinship_1.0/data/finngen_R12.kin0"
+cmd <- glue('grep -E "{conv["pseudonym1"]}" {filename}')
+system(cmd)
+```
+
+They are not related.
+
+#### Stratified summary statistics of venesection counts
+
+```{r}
+cases %>% group_by(sex2) %>% summarise(individuals = n(), count_mean = mean(n), count_var = var(n)) %>%
+  bind_rows(
+    cases %>% summarise(individuals = n(), count_mean = mean(n), count_var = var(n)) %>% mutate(sex2="all")
+  )
+```
+
+
+## Covariates
+
+Plot age and number of donations.
+
+```{r}
+breaks1 <- cut_helper_variable_width(cases, "age")$breaks
+g1 <- cases %>% #pivot_longer(cols=c(age, donations_in_five_years)) %>%
+  ggplot(aes(age)) + geom_histogram(breaks = breaks1)# + facet_wrap(~name, scales="free")
+g2 <- cases %>% 
+  mutate(across(donations_in_five_years, as.factor)) %>% 
+  ggplot(aes(donations_in_five_years)) + geom_bar() + scale_y_log10()
+g1 + g2
+```
+
+```{r}
+sprintf("There are %s cases with blood donations", sum(cases$donations_in_five_years > 0))
+```
+
+
+
+Check the time from first venesection to eof.
+
+```{r}
+tmp <- full_data %>% left_join(eof_date, by="sample")
+tmp2 <- tmp %>% 
+  mutate(diff = eof_date - first_venesection_date) %>% 
+  select(hemochromatosis, diff) %>% filter(! is.na(diff)) %>%
+  mutate(inside = diff < 2*365)
+tmp2 %>% ggplot(aes(as.numeric(diff/365))) + geom_histogram() + labs(x="Years", title="Time from first venesection to eof")
+res <- tmp2 %>%
+  summarise(s = sum(inside), f = mean(inside), n = n())
+```
+
+```{r}
+sprintf("%.1f%% (%i / %i) of venesectees are still in their initial two-year window at the end of followup\n", 
+        res$f * 100,
+        res$s, res$n) %>% 
+  cat()
+```
+
+## Modeling
+
+### Scale and transform
+
+```{r}
+train_scaled <- train_data %>% 
+  mutate(age = as.numeric(scale(age)),
+         across(c(H63D, C282Y), as.factor))
+```
+
+```{r}
+full_scaled <- full_data %>% 
+  mutate(age = as.numeric(scale(age)),
+         across(c(H63D, C282Y), as.factor))
+```
+
+### Fit models
+
+```{r}
+#step_interact(terms = ~ starts_with("C282Y") : c(starts_with("H63D"), S65C, supersnip, donations_in_five_years, sex2_pre, sex2_post
+variables5 <- c("sex2", "age", "donations_in_five_years", 
+                #"H1_2", # is correlated with C282Y
+                "H63D", "S65C", "C282Y", 
+                "supersnip",
+                "credible1", "credible2", 
+                "credible3",
+                "rs3094093", "rs114179634", #, "rs9261354"  # HLA snips
+                # Interactions
+                "C282Y:H63D", "C282Y:S65C", "C282Y:supersnip", "C282Y:donations_in_five_years", "C282Y:sex2"
+                )
+f5v <- sprintf("n ~ %s", paste(variables5, collapse=" + "))
+f5v_zi <- paste(f5v, "| 1")
+f5v
+f5v_zi
+```
+
+
+
+
+```{r}
+m <- my_expand(f5v, train_scaled)
+m_full <- my_expand(f5v, full_scaled)
+stopifnot(all(colnames(m) == colnames(m_full)))   # Make sure same set of variables are used for both train and full data
+summary(m)
+```
+
+Drop unneeded data.
+
+```{r}
+rm(train_data, train_scaled)
+rm(full_data, full_scaled)
+```
+
+Final formula:
+
+```{r}
+expanded_variables <- setdiff(colnames(m_full), responses)
+f_basic <- sprintf("n ~ %s", expanded_variables %>% paste(collapse = " + "))
+f_basic
+f_basic1 <- sprintf("n ~ %s | 1", expanded_variables %>% paste(collapse = " + "))
+f_basic1
+```
+
+#### Poisson
+
+Train data.
+
+Warning: glm.fit: fitted rates numerically 0 occurred
+
+```{r}
+filename <- file.path(model_path, "poisson.rds")
+if (! file.exists(filename) || recompute) {
+  tic("poisson")
+  if (use_expanded_matrix)
+    fit_poisson <- glm(as.formula(f_basic), data = m, family = poisson(link="log"))
+  else 
+    fit_poisson <- glm(as.formula(f5v), data=train_scaled, family = poisson(link="log"))
+  toc()
+  saveRDS(fit_poisson, filename)
+} else {
+  fit_poisson <- readRDS(filename)
+}
+summary(fit_poisson)
+```
+
+Full data.
+
+```{r}
+filename <- file.path(model_path, "poisson_full.rds")
+if (! file.exists(filename) || recompute) {
+  tic("poisson_full")
+  if (use_expanded_matrix)
+    fit_poisson_full <- glm(as.formula(f_basic), data = m_full, family = poisson(link="log"))
+  else
+    fit_poisson_full <- glm(as.formula(f5v), data = full_scaled, family = poisson(link="log"))
+  toc()
+  saveRDS(fit_poisson_full, filename)
+} else {
+  fit_poisson_full <- readRDS(filename)
+}
+summary(fit_poisson_full)
+```
+
+```{r}
+my_ggdiagnostics(fit_poisson_full)
+```
+
+Does not look very good. Probably the peak in Cook's distance is due to those observations with venesections.
+
+```{r}
+variable_plots(fit_poisson_full)
+```
+
+#### Negative binomial
+
+The NegBin(mu, theta) distribution is parameterized by two parameters. The mean mu is positive real number
+estimated for each observation (the response of the model). The shape parameter theta is common for all observation
+and is estimated during fitting with MASS::glm.nb. If one fits with glm function, the theta is not estimated and
+must be given as parameter.
+
+Does not work after removing the restriction to cases only. It does work again after resplitting the data!
+
+Warning: glm.fit: fitted rates numerically 0 occurred
+
+```{r, eval=TRUE}
+filename <- file.path(model_path, "nb.rds")
+if (! file.exists(filename) || recompute) {
+  tic("nb")
+  if (use_expanded_matrix)
+    fit_nb <- MASS::glm.nb(as.formula(f_basic), data=m, control=glm.control(maxit=200))  # Default number of iterations is 25
+  else
+    fit_nb <- MASS::glm.nb(as.formula(f5v), train_scaled, control=glm.control(maxit=200))  # Default number of iterations is 25
+  toc()
+  saveRDS(fit_nb, filename)
+  } else {
+  fit_nb<- readRDS(filename)
+}
+summary(fit_nb)
+```
+
+Full data.
+
+```{r}
+filename <- file.path(model_path, "nb_full.rds")
+if (! file.exists(filename) || recompute) {
+  tic("nb_full")
+  if (use_expanded_matrix)
+    fit_nb_full <- MASS::glm.nb(as.formula(f_basic), data = m_full, control=glm.control(maxit=200))
+  else
+    fit_nb_full <- MASS::glm.nb(as.formula(f5v), data = full_scaled, control=glm.control(maxit=200))
+  toc()
+  saveRDS(fit_nb_full, filename)
+} else {
+  fit_nb_full <- readRDS(filename)
+}
+summary(fit_nb_full)
+```
+
+"Dispersion parameter for Negative Binomial(7e-04) family taken to be 1"
+The difference 0.00030745 != 7e-4 is probably due to the algorithm failing to converge.
+
+See also
+https://stats.stackexchange.com/questions/583437/dispersion-parameter-in-negative-binomial/583798#583798
+
+Theta is the shape parameter of the negative binomial distribution, which the glm.nb function estimates. This is sometimes also
+confusingly called "dispersion parameter", but not here. The summary method by default assumes that dispersion is 1.
+But it can be also estimated with
+
+```{r, eval=TRUE}
+sum(residuals(fit_nb, type = "pearson")**2) / summary(fit_nb)$df.residual
+```
+
+The summary method can be instructed to compute and use the dispersion parameter with
+
+```{r, eval=TRUE}
+summary.glm(fit_nb, dispersion = NULL)$dispersion
+```
+
+Not sure why there is a small difference. But anyway they are both close to 1.
+
+```{r}
+my_ggdiagnostics(fit_nb_full)
+```
+
+
+#### Zero-inflated poisson
+
+Train data.
+
+Warning: glm.fit: fitted rates numerically 0 occurred
+
+```{r}
+filename <- file.path(model_path, "zip.rds")
+if (! file.exists(filename) || recompute) {
+  tic("zip")
+  if (use_expanded_matrix)
+    fit_zip <- zeroinfl(as.formula(f_basic1), data = m, dist="poisson")
+  else
+    fit_zip <- zeroinfl(as.formula(f5v_zi), data = train_scaled, dist="poisson")
+  toc()
+  saveRDS(fit_zip, filename)
+  } else {
+  fit_zip <- readRDS(filename)
+}
+summary(fit_zip)
+```
+
+Full data.
+
+```{r}
+filename <- file.path(model_path, "zip_full.rds")
+if (! file.exists(filename) || recompute) {
+  tic("zip_full")
+  if (use_expanded_matrix)
+    fit_zip_full <- zeroinfl(as.formula(f_basic1), data = m_full, dist="poisson")
+  else
+    fit_zip_full <- zeroinfl(as.formula(f5v_zi), data = full_scaled, dist="poisson")
+  toc()
+  saveRDS(fit_zip_full, filename)
+  } else {
+  fit_zip_full <- readRDS(filename)
+}
+summary(fit_zip_full)
+```
+
+#### Zero-inflated negative binomial
+
+Train data.
+
+Warning: glm.fit: fitted rates numerically 0 occurred
+
+```{r}
+filename <- file.path(model_path, "zinb.rds")
+if (! file.exists(filename) || recompute) {
+  tic("zinb")
+  if (use_expanded_matrix)
+    fit_zinb <- zeroinfl(as.formula(f_basic1), data = m, dist="negbin")
+  else
+    fit_zinb <- zeroinfl(as.formula(f5v_zi), data = train_scaled, dist="negbin")
+  toc()
+  saveRDS(fit_zinb, filename)
+} else {
+  fit_zinb <- readRDS(filename)
+}
+summary(fit_zinb)
+```
+
+Full data.
+
+```{r}
+filename <- file.path(model_path, "zinb_full.rds")
+if (! file.exists(filename) || recompute) {
+  tic("zinb_full")
+  if (use_expanded_matrix)
+    fit_zinb_full <- zeroinfl(as.formula(f_basic1), data = m_full, dist="negbin")
+  else
+    fit_zinb_full <- zeroinfl(as.formula(f5v_zi), data = full_scaled, dist="negbin")
+  toc()
+  saveRDS(fit_zinb_full, filename)
+} else {
+  fit_zinb_full <- readRDS(filename)
+}
+summary(fit_zinb_full)
+```
+
+These models use the same predictors for both the count and zero components.
+
+#### ZIP2
+
+Train data.
+
+Warning: glm.fit: fitted probabilities numerically 0 or 1 occurredWarning: glm.fit: fitted rates numerically 0 occurredWarning: system is computationally singular: reciprocal condition number = 9.63268e-20FALSE
+
+```{r}
+filename <- file.path(model_path, "zip2.rds")
+if (! file.exists(filename) || recompute) {
+  tic("zip2")
+  if (use_expanded_matrix)
+    fit_zip2 <- zeroinfl(as.formula(f_basic), data = m, dist="poisson")
+  else
+    fit_zip2 <- zeroinfl(as.formula(f5v), data = train_scaled, dist="poisson")
+  toc()
+  saveRDS(fit_zip2, filename)
+} else {
+  fit_zip2 <- readRDS(filename)
+}
+summary(fit_zip2)
+```
+
+Testing capturing warnings.
+
+
+
+```{r, eval=FALSE}
+f <- function() {
+  Sys.sleep(1)
+  warning("Eka\n")
+  Sys.sleep(1)
+  warning("Toka\n")
+  Sys.sleep(1)
+  warning("Kolmas\n")
+  Sys.sleep(1)
+  warning("Kolmas\n")
+  "return value"
+}
+```
+
+
+
+```{r, eval=FALSE}
+options(warn = 1)  # Show warnings immediately
+res <- capture_warnings(f())
+c(result, warnings) %<-% capture_warnings(f())  # using zeallot package 
+
+options(warn = o)  # Show all warnings only at the end
+res$warnings %>% map_chr(~ .$message) %>% fct_count()
+res2 <- capture_warnings(zeroinfl(as.formula(f_basic), data = m, dist="poisson"))
+res2$warnings %>% map_chr(~ .$message) %>% fct_count()
+```
+
+Full data.
+
+```{r}
+filename <- file.path(model_path, "zip2_full.rds")
+if (! file.exists(filename) || recompute) {
+  tic("zip2_full")
+  if (use_expanded_matrix)
+    fit_zip2_full <- zeroinfl(as.formula(f_basic), data = m_full, dist="poisson")
+  else
+    fit_zip2_full <- zeroinfl(as.formula(f5v), data = full_scaled, dist="poisson")
+  toc()
+  saveRDS(fit_zip2_full, filename)
+} else {
+  fit_zip2_full <- readRDS(filename)
+}
+summary(fit_zip2_full)
+```
+
+```{r}
+rootogram(fit_zip2_full)
+```
+
+Following does not work. Member family is not part of zero-inflated model.
+
+```{r}
+#y_ggdiagnostics(fit_zip2_full)
+```
+
+Original full data. Check that the result is same as above
+
+```{r, eval=FALSE}
+filename <- file.path(model_path, "zip2_full_orig.rds")
+if (! file.exists(filename) || recompute) {
+  tic("zip2_full_orig")
+  if (use_expanded_matrix)
+    fit_zip2_full_orig <- zeroinfl(n ~ ., data = m_full %>% select(-c(n_all, n_window, n_full_window)), dist="poisson")
+  else
+    fit_zip2_full_orig <- zeroinfl(as.formula(f5v), data = full_scaled, dist="poisson")
+  toc()
+  saveRDS(fit_zip2_full_orig, filename)
+} else {
+  fit_zip2_full_orig <- readRDS(filename)
+}
+summary(fit_zip2_full_orig)
+```
+
+The result looks the same.
+
+Venesection count in the 2-year window:
+
+```{r, eval=FALSE}
+filename <- file.path(model_path, "zip2_full_window.rds")
+if (! file.exists(filename) || recompute) {
+  tic("zip2_full_window")
+  fit_zip2_full_window <- zeroinfl(n_window ~ ., data = m_full %>% select(-c(n_all, n, n_full_window)), dist="poisson")
+  toc()
+  saveRDS(fit_zip2_full_window, filename)
+} else {
+  fit_zip2_full_window <- readRDS(filename)
+}
+summary(fit_zip2_full_window)
+```
+
+Venesection count in the strict 2-year window. The window must not contain the eof date.
+
+```{r, eval=FALSE}
+# Note, here I should do the scaling of age differently, since I filter out individuals.
+filename <- file.path(model_path, "zip2_full_full_window.rds")
+if (! file.exists(filename) || recompute) {
+  tic("zip2_full_full_window")
+  fit_zip2_full_full_window <- zeroinfl(n_full_window ~ ., 
+                                        data = m_full %>% select(-c(n_all, n, n_window)) %>% replace_na(list(n_full_window=0)) %>% filter(n_full_window >= 0), 
+                                        dist="poisson")
+  toc()
+  saveRDS(fit_zip2_full_full_window, filename)
+} else {
+  fit_zip2_full_full_window <- readRDS(filename)
+}
+summary(fit_zip2_full_full_window)
+```
+
+#### ZINB2
+
+Train data.
+
+Warning: glm.fit: fitted probabilities numerically 0 or 1 occurredWarning: glm.fit: fitted rates numerically 0 occurredWarning: system is computationally singular: reciprocal condition number = 9.85978e-19FALSE
+
+```{r}
+filename <- file.path(model_path, "zinb2.rds")
+if (! file.exists(filename) || recompute) {
+  tic("zinb2")
+  if (use_expanded_matrix)
+    fit_zinb2 <- zeroinfl(as.formula(f_basic), data = m, dist="negbin")
+  else
+    fit_zinb2 <- zeroinfl(as.formula(f5v), data = train_scaled, dist="negbin")
+  toc()
+  saveRDS(fit_zinb2, filename)
+} else {
+  fit_zinb2 <- readRDS(filename)
+}
+summary(fit_zinb2)
+```
+
+Full data.
+
+```{r}
+filename <- file.path(model_path, "zinb2_full.rds")
+if (! file.exists(filename) || recompute) {
+  tic("zinb2_full")
+  if (use_expanded_matrix) {
+    fit_zinb2_full <- zeroinfl(n ~ ., data = m_full %>% select(-c(n_all, n_window, n_full_window)), dist="negbin")
+    #fit_zinb2_full <- zeroinfl(as.formula(f_basic), data = m_full, dist="negbin")
+  } else
+    fit_zinb2_full <- zeroinfl(as.formula(f5v), data = full_scaled, dist="negbin")
+  toc()
+  saveRDS(fit_zinb2_full, filename)
+} else {
+  fit_zinb2_full <- readRDS(filename)
+}
+summary(fit_zinb2_full)
+```
+
+### Fit with exposure
+
+In the exposure model, instead of counts we model the incidents in a time unit.
+Here exposure starts from the diagnosis of hemochromatosis and will continue until the end of follow-up.
+The exposure time (in years) is individual specific.
+
+Exposure and offset:
+https://en.wikipedia.org/wiki/Poisson_regression#%22Exposure%22_and_offset
+Incidence rate ratio, exposure:
+https://stats.stackexchange.com/a/17010
+
+```{r}
+# variables_exposure <- c("sex2", "age", "donations_in_five_years", 
+#                 #"H1_2", # is correlated with C282Y
+#                 "H63D", "S65C", "C282Y", 
+#                 "supersnip",
+#                 "credible1", "credible2", 
+#                 "credible3",
+#                 "rs3094093", "rs114179634", #, "rs9261354"  # HLA snips
+#                 # Interactions
+#                 "C282Y:H63D", "C282Y:S65C", "C282Y:supersnip", "C282Y:donations_in_five_years", "C282Y:sex2"
+#                 )
+# Number of donations causes problems, I will drop them here.
+variables_exposure <- c("sex2", "age", #"donations_in_five_years", 
+                "H63D", "S65C", "C282Y", 
+                "supersnip",
+                "credible1", "credible2", 
+                "credible3",
+                "rs3094093", "rs114179634", #, #"rs9261354"  # HLA snips
+                # Interactions
+                "C282Y:H63D" #"C282Y:S65C", "C282Y:supersnip", "C282Y:donations_in_five_years", "C282Y:sex2"
+                )
+f_exposure2 <- sprintf("n ~ %s", paste(variables_exposure, collapse=" + "))
+f_exposure2
+```
+
+Some levels combinations in interactions are missing. Hence, I need to convert to model.matrix and then preprocess the data to
+exclude constant columns.
+
+
+```{r}
+sprintf("Exposure data has %i individuals\n", nrow(combined_with_exposure)) %>% cat()
+```
+
+I also drop the interaction C282Y1:donations_in_five_years, since it gets huge std error in all models.
+
+```{r}
+combined_with_exposure_scaled <- combined_with_exposure %>% 
+  mutate(age = as.numeric(scale(age)),
+         across(c(H63D, C282Y), as.factor))
+```
+
+```{r}
+m_exposure <- my_expand(f_exposure2, combined_with_exposure_scaled)
+m_exposure %>% mutate(across(-c(age, n), as.factor)) %>% summary()
+```
+
+Final formula:
+
+```{r}
+expanded_variables <- setdiff(colnames(m_exposure), responses)
+f_exposure <- sprintf("n ~ %s", expanded_variables %>% paste(collapse = " + "))
+f_exposure
+```
+
+Drop unneeded data.
+
+
+#### ZIP2 
+
+```{r}
+filename <- file.path(model_path, "zip2_exposure.rds")
+if (! file.exists(filename) || recompute) {
+  tic("zip2_exposure")
+  fit_zip2_exposure <- zeroinfl(as.formula(f_exposure), offset = log(combined_with_exposure_scaled$exposure), data = m_exposure, dist="poisson")
+  toc()
+  saveRDS(fit_zip2_exposure, filename)
+} else {
+  fit_zip2_exposure <- readRDS(filename)
+}
+summary(fit_zip2_exposure)
+```
+
+#### ZINB2
+
+```{r}
+filename <- file.path(model_path, "zinb2_exposure.rds")
+if (! file.exists(filename) || recompute) {
+  tic("zinb2_exposure")
+  fit_zinb2_exposure <- zeroinfl(as.formula(f_exposure), offset = log(combined_with_exposure_scaled$exposure), data = m_exposure, dist="negbin")
+  toc()
+  saveRDS(fit_zinb2_exposure, filename)
+} else {
+  fit_zinb2_exposure <- readRDS(filename)
+}
+summary(fit_zinb2_exposure)
+```
+
+Theta is quite far away from 1.
+
+#### Confidence intervals
+
+```{r}
+# Count components
+cis_zip2_exposure    <- cis_helper(fit_zip2_exposure,    "cis_zip2_exposure.tsv",  model="count")
+cis_zinb2_exposure   <- cis_helper(fit_zinb2_exposure,   "cis_zinb2_exposure.tsv", model="count")
+
+# Zero components
+cis_zero_zip2_exposure    <- cis_helper(fit_zip2_exposure,         "cis_zero_zip2_exposure.tsv",  model="zero")
+cis_zero_zinb2_exposure   <- cis_helper(fit_zinb2_exposure,        "cis_zero_zinb2_exposure.tsv", model="zero")
+```
+
+```{r}
+g1 <- bind_rows(zip2 = cis_zip2_exposure, zinb2 = cis_zinb2_exposure, .id = "model") %>%
+  plot_cis2("Count component") + 
+  labs(x="Incidence rate ratio", color="Model") + theme(axis.title.y = element_blank()) +
+  guides(colour = guide_legend(reverse = TRUE, override.aes = list(shape = 16)))
+g2 <- bind_rows(zip2 = cis_zero_zip2_exposure, zinb2 = cis_zero_zinb2_exposure, .id = "model") %>%
+  plot_cis2("Zero component") + 
+  labs(x="Incidence rate ratio", color="Model") + theme(axis.title.y = element_blank(), axis.text.y = element_blank()) +
+  guides(colour = guide_legend(reverse = TRUE, override.aes = list(shape = 16)))
+g1 + g2 + plot_layout(guides = "collect") + plot_annotation(title = "Exposure model")
+```
+
+Don't really know how to interpret these. Why is the effect of C282Y negative in the count component?
+Not many significant effect, if we consider zinb2 to be the correct model.
+
+#### Diagnostics
+
+```{r}
+g1 <- get_qqplot("zip2_exposure", m_exposure)
+g2 <- get_qqplot("zinb2_exposure", m_exposure)
+g1 + g2
+```
+
+Poisson version is really bad!
+
+```{r}
+g1 <- get_rootogram("zip2_exposure", m_exposure)
+g2 <- get_rootogram("zinb2_exposure", m_exposure)
+g1 + g2
+```
+
+### Score model for nb
+
+Idea here was to combine several genetic variables into one to increase power and make
+confidence intervals narrower.
+
+```{r}
+score_components <-  c(
+                "H63D", "S65C", "C282Y", 
+                "supersnip",
+                "credible1",
+                "credible3",
+                "rs3094093", "rs114179634" )  # HLA snips
+full_genetic_model <- TRUE
+if (full_genetic_model) {
+  score_components <- c(setdiff(score_components, c("H63D",  "C282Y")),
+                        paste0("H63D", 1:2),
+                        paste0("C282Y", 1:2))
+}
+variables_score <- c("sex2", "age", "donations_in_five_years", "genetic_score")
+
+f_score <- sprintf("n ~ %s", paste(variables_score, collapse=" + "))
+f_score
+```
+
+Form score as the weighted sum of all genetic predictors.
+
+```{r, eval=FALSE}
+M <- model.matrix(fit_nb)[,score_components]
+v <- coef(fit_nb)[score_components]
+score <- as.numeric(M %*% v)
+cases_score <- cases_scaled %>% mutate(genetic_score = score)
+```
+
+```{r, eval=FALSE}
+fit_nb_score <- MASS::glm.nb(as.formula(f_score), cases_score, control=glm.control(maxit=200))  # Default number of iterations is 25
+summary(fit_nb_score)
+```
+
+
+```{r, eval=FALSE}
+cis_nb_score <- compute_cis(fit_nb_score)
+cis_nb_score %>%
+  plot_cis("Regression of venesection counts", subtitle=sprintf("n=%i", nrow(cases))) +
+  labs(x="Incidence ratio") + #theme_minimal() + 
+  scale_x_log10() #+ theme_classic() + lims(x=c(0.25, 30))
+```
+
+### Read models
+
+```{r}
+model_ids <- c("poisson", "poisson_full", "nb", "nb_full", "zip", "zip_full",
+                 "zinb", "zinb_full", "zip2", "zip2_full", "zinb2", "zinb2_full")
+get_model <- function(model_id) {
+  model_filename <- sprintf("%s.rds", model_id)
+  model_name <- sprintf("fit_%s", model_id)
+  cat(sprintf("Read model %s from file %s\n", model_name, model_filename))
+  mod <- readRDS(file.path(model_path, model_filename))
+  assign(model_name, mod, envir = rlang::global_env())
+}
+```
+
+```{r, eval=FALSE}
+walk(model_ids, get_model)
+```
+
+### Diagnostics
+
+The following two are extremely slow.
+
+```{r, eval=FALSE}
+filename <- file.path(figure_path, "check_poisson.pdf")
+tic("check_poisson")
+check_poisson_g <- fit_poisson %>% performance::check_model() %>% plot()  # Requires the 'see' package
+toc()
+if (save_figs)
+  ggsave(filename, check_poisson_g)
+#check_poisson_g
+```
+
+Error in loadNamespace(j <- i[[1L]], c(lib.loc, .libPaths()), versionCheck = vI[[j]]) : 
+  namespace ‘insight’ 1.2.0 is already loaded, but >= 1.4.1 is required
+  
+Why is this? 
+
+> packageVersion("insight")
+[1] ‘1.4.2’
+
+```{r, eval=FALSE}
+filename <- file.path(figure_path, "check_nb.pdf")
+check_nb_g <- fit_nb %>% performance::check_model() %>% plot()
+if (save_figs)
+  ggsave(filename, check_nb_g)
+```
+
+#### qqplots
+
+To make thing faster and use less memory I only take a small sample of the full data.
+
+```{r}
+set.seed(123)
+new_data <- m %>% slice_sample(n=10000)
+```
+
+```{r}
+new_data %>% pull(n) %>% table()
+```
+
+
+
+
+
+
+```{r, eval=FALSE}
+#get_qqplot("zip2", new_data)
+qqplots <- map(model_ids, function(name) get_qqplot(name, new_data))
+g_qq <- reduce(qqplots, `+`)   # Combine all plots with patchwork
+filename <- file.path(figure_path, "qqplots_2year_strict.pdf")
+ggsave(filename, g_qq, width = 7, height = 7)
+g_qq
+```
+
+#### Rootograms
+
+
+
+```{r, eval=FALSE}
+#new_data <- m %>% slice_sample(n=1000)
+#get_rootogram("nb", new_data)
+rootograms <- model_ids %>% #discard(~ str_starts(., "nb")) %>% 
+  set_names() %>% map(function(name) get_rootogram(name, new_data))
+g_root <- reduce(rootograms, `+`)   # Combine all plots with patchwork
+filename <- file.path(figure_path, "rootograms_2year_strict.pdf")
+ggsave(filename, g_root, width = 7, height = 7)
+g_root
+```
+
+The negative binomial models distributions have very long tail!
+
+### Glance
+
+```{r}
+dispersion <- function(fit) {
+  sum(residuals(fit, type = "pearson")^2) / df.residual(fit)
+}
+# Computes the maximum standard error of the predictor coefficients
+maximum_se <-function(fit) max(sqrt(diag(vcov(fit))))
+```
+
+```{r}
+compute_stats <- function(fit) {
+  n <- if ("glm" %in% class(fit)) length(fit[["y"]]) else fit[["n"]] 
+  tibble(df.null=summary(fit)$df.null, logLik=as.numeric(logLik(fit)), AIC=AIC(fit), BIC=BIC(fit),
+         df.residual=df.residual(fit), nobs=n, converged=fit$converged)
+  
+}
+filename <- file.path(table_path, "progression_model_stats.tsv")
+if (recompute || ! file.exists(filename)) {
+  models <- list(
+    poisson = fit_poisson, 
+    nb = fit_nb, 
+    zip = fit_zip, 
+    zinb = fit_zinb, 
+    zip2 = fit_zip2, 
+    zinb2 = fit_zinb2, 
+    
+    poisson_full = fit_poisson_full, 
+    nb_full = fit_nb_full, 
+    zip_full = fit_zip_full, 
+    zinb_full = fit_zinb_full, 
+    zip2_full = fit_zip2_full, 
+    zinb2_full = fit_zinb2_full)
+  stats <- map(models, compute_stats) %>% bind_rows(.id = "model")
+  stats <- stats %>% mutate(dispersion = map_dbl(models, dispersion),
+                            max_se = map_dbl(models, maximum_se))
+  unrealistic_values <- map(models, exact_zeros_or_ones) %>% bind_rows(.id = "model")
+  stats <- stats %>% inner_join(unrealistic_values, by="model")
+  #if (save_tables)
+  write_tsv(stats, filename)
+} else {
+  stats <- read_tsv(filename)
+}
+stats
+```
+
+```{r}
+rm(models)
+```
+
+All model fitted on train data failed and those trained on full data succeeded (with the exception of zinb_full).
+
+
+Check zero inflation.
+
+```{r}
+performance::check_zeroinflation(fit_poisson)
+```
+
+```{r}
+performance::check_zeroinflation(fit_nb)
+```
+
+Check overdispersion.
+
+```{r}
+performance::check_overdispersion(fit_poisson)
+```
+
+```{r, eval=FALSE}
+performance::check_overdispersion(fit_nb)
+```
+
+These functions don't work for zero-inflated models!
+
+What does this mean?
+
+https://stats.stackexchange.com/questions/230730/negative-binomial-for-underdispersed-data
+
+### Confidence intervals
+
+```{r}
+cis_helper <- function(fit, filename2, ...) {
+  tryCatch(
+    error = function(cnd) {message(conditionMessage(cnd)); NULL},
+    {
+      filename = file.path(table_path, filename2)
+      message(sprintf("Filename is %s", filename))
+      if (! file.exists(filename) || recompute) {
+        message("recomputing")
+        cis <- compute_cis(fit, ...)
+        write_tsv(cis, filename)
+        cis
+      } else{
+        message(paste("Loading from file", filename))
+        read_tsv(filename, col_types = cols(
+          term = col_character(),
+          conf.low = col_double(),
+          conf.high = col_double(),
+          estimate = col_double()
+        ))
+      }
+    }
+  )
+}
+```
+
+
+```{r}
+cis_poisson      <- cis_helper(fit_poisson,      "cis_poisson.tsv")   # failed, glm.fit: fitted rates numerically 0 occurredError: no valid set of coefficients has been found: please supply starting values
+cis_poisson_full <- cis_helper(fit_poisson_full, "cis_poisson_full.tsv")
+cis_nb           <- cis_helper(fit_nb,           "cis_nb.tsv")       # Warning: glm.fit: algorithm did not converge
+cis_nb_full      <- cis_helper(fit_nb_full,      "cis_nb_full.tsv")
+cis_zip          <- cis_helper(fit_zip,          "cis_zip.tsv")
+cis_zip_full     <- cis_helper(fit_zip_full,     "cis_zip_full.tsv")
+#cis_zinb         <- cis_helper(fit_zinb,         "cis_zinb.tsv")  # slow
+cis_zinb_full    <- cis_helper(fit_zinb_full,    "cis_zinb_full.tsv")  # slow
+# Count components
+cis_zip2         <- cis_helper(fit_zip2,         "cis_zip2.tsv",       model="count")
+cis_zip2_full    <- cis_helper(fit_zip2_full,    "cis_zip2_full.tsv",  model="count")
+#cis_zinb2       <- cis_helper(fit_zinb2,        "cis_zinb2.tsv",      model="count")
+cis_zinb2_full   <- cis_helper(fit_zinb2_full,   "cis_zinb2_full.tsv", model="count")
+
+# Zero components
+cis_zero_zip2    <- cis_helper(fit_zip2,         "cis_zero_zip2.tsv",  model="zero")
+cis_zero_zinb2   <- cis_helper(fit_zinb2,        "cis_zero_zinb2.tsv", model="zero")
+cis_zero_zip2_full    <- cis_helper(fit_zip2_full,         "cis_zero_zip2_full.tsv",  model="zero")
+cis_zero_zinb2_full   <- cis_helper(fit_zinb2_full,        "cis_zero_zinb2_full.tsv", model="zero")
+
+# Alternative versions of models
+cis_zip2_full_window         <- cis_helper(fit_zip2_full_window,         "cis_zip2_full_window.tsv",  model="count")
+cis_zip2_full_full_window    <- cis_helper(fit_zip2_full_full_window,    "cis_zip2_full_full_window.tsv",  model="count")
+
+```
+
+Compare model zip2 on train data and full data.
+
+```{r}
+cis_tmp <- bind_rows(train = cis_zip2, full = cis_zip2_full, .id="model") %>% mutate(model = factor(model))
+cis_tmp %>% plot_cis2("zip2 comparison") + labs(x="Incidence ratio", color="Data") + theme(axis.title.y = element_blank())
+rm(cis_tmp)
+```
+
+Compare three definitions of response for model zip2 on full data.
+
+```{r, eval=FALSE}
+#cis_zip2_full_old <- read_tsv(file.path(table_path, "cis_zip2_full_old.tsv"))
+cis_tmp3 <- bind_rows(n = cis_zip2_full, n_window = cis_zip2_full_window,  n_full_window = cis_zip2_full_full_window, 
+                      .id="model") %>% mutate(model = factor(model, levels = c("n", "n_window", "n_full_window")))
+cis_tmp3 %>%
+  mutate(model = fct_rev(model)) %>%
+  plot_cis2("zip2 comparison") + 
+  labs(x="Incidence ratio", color="Data") + 
+  #scale_color_discrete(breaks = c("old", "new")) +
+  guides(colour = guide_legend(reverse = TRUE, override.aes = list(shape = 16))) +
+  theme(axis.title.y = element_blank())
+#rm(cis_tmp3)
+```
+
+Compare just the two definitions of response for model zip2 on full data.
+
+```{r, eval=FALSE}
+cis_tmp3 %>%
+  filter(model != "n_full_window") %>%
+  droplevels() %>%
+  mutate(model = fct_rev(model)) %>%
+  plot_cis2("zip2 comparison") + 
+  labs(x="Incidence ratio", color="Data") + 
+  #scale_color_discrete(breaks = c("old", "new")) +
+  guides(colour = guide_legend(reverse = TRUE, override.aes = list(shape = 16))) +
+  theme(axis.title.y = element_blank())
+```
+
+Compare old and new model zip2 on full data.
+
+```{r, eval=FALSE}
+cis_zip2_full_old <- read_tsv(file.path(table_path, "cis_zip2_full_old.tsv"), col_types = cols(
+  term = col_character(),
+  conf.low = col_double(),
+  conf.high = col_double(),
+  estimate = col_double()
+))
+cis_tmp2 <- bind_rows(old = cis_zip2_full_old, new = cis_zip2_full, .id="model") %>% mutate(model = factor(model))
+cis_tmp2 %>% plot_cis2("zip2 comparison") + 
+  labs(x="Incidence ratio", color="Data") + 
+  scale_color_discrete(breaks = c("old", "new")) +
+  theme(axis.title.y = element_blank())
+rm(cis_tmp2)
+```
+
+```{r}
+mylevels <- c("poisson", "nb", "zip", "zinb", "zip2", "zinb2",
+              "poisson_full", "nb_full", "zip_full", "zinb_full", "zip2_full", "zinb2_full")
+cis_count <- bind_rows(#poisson=cis_poisson, nb=cis_nb, 
+                       poisson_full=cis_poisson_full, nb_full=cis_nb_full, 
+                       zip_full=cis_zip_full, zinb_full=cis_zinb_full, 
+                       #zip2=cis_zip2, zinb2=cis_zinb2, 
+                       zip2_full=cis_zip2_full, zinb2_full=cis_zinb2_full, 
+                       .id="model") %>%
+  mutate(model = factor(model, levels=mylevels))
+if (save_tables) {
+  filename <- file.path(table_path, "full_models_forest.tsv")
+  write_tsv(cis_count, filename)
+}
+```
+
+```{r}
+g <- cis_count %>%
+  #filter(term == "age") %>% # REMOVE THIS LINE!!!!!!!!!!!!!!!!!!!!!!
+  mutate(model = fct_drop(model)) %>% # Drop unused levels
+  mutate(model = fct_rev(model)) %>%
+  plot_cis2("Regression of venesection counts (count component)", subtitle=sprintf("n=%i", nrow(m_full)), na.rm = FALSE) +
+  #geom_point(data = tibble(x=c(0.3, 0.5, 1.5, 2), y=1.5), mapping=aes(x, y), inherit.aes = FALSE) +
+  labs(x="Incidence ratio") + #theme_minimal() + 
+  #facet_wrap(~ model) +
+  #scale_color_discrete(breaks=mylevels) +
+  #scale_fill_discrete(breaks=mylevels) +
+  guides(colour = guide_legend(reverse = TRUE, override.aes = list(shape = 16))) +
+  coord_cartesian(xlim = c(1e-2, 1e+2)) +
+  #scale_color_manual(breaks=c("zip", "poisson", "nb"), labels="") +
+  #scale_x_log10(minor_breaks=c(1.5, 2.0)) #+ theme_classic() + lims(x=c(0.25, 30))
+  NULL
+if (save_figs) {
+  filename <- file.path(figure_path, "full_models_forest.pdf")
+  ggsave(filename, g)
+}
+g
+```
+
+"If a Poisson model is fitted under overdispersion of the response, then the standard errors of the estimated coefficients are underestimated." 
+
+
+
+
+```{r}
+#cis_zero <- bind_rows(zip2=cis_zip2, #zinb2=cis_zinb2, 
+cis_zero <- bind_rows(#poisson_full=cis_poisson_full, nb_full=cis_nb_full, 
+                       #zip_full=cis_zip_full, zinb_full=cis_zinb_full, 
+                       zip2_full=cis_zip2_full, zinb2_full=cis_zinb2_full, 
+                      .id="model") %>%
+  mutate(model = factor(model, levels=mylevels))
+```
+
+```{r}
+cis_zero %>%
+  mutate(model = fct_rev(model)) %>%
+  plot_cis2("Regression of venesection counts (zero component)", subtitle=sprintf("n=%i", nrow(m_full))) +
+  #geom_point(data = tibble(x=c(0.3, 0.5, 1.5, 2), y=1.5), mapping=aes(x, y), inherit.aes = FALSE) +
+  labs(x="Incidence ratio") + #theme_minimal() + 
+  #facet_wrap(~ model) +
+  scale_color_discrete(breaks=mylevels) +
+  #scale_color_manual(breaks=c("zip", "poisson", "nb"), labels="") +
+  scale_x_log10(minor_breaks=c(1.5, 2.0)) #+ theme_classic() + lims(x=c(0.25, 30))
+```
+
+Both components in the same plot.
+
+```{r}
+cis <- bind_rows(count = cis_count, zero = cis_zero, .id="component")
+```
+
+```{r}
+g <- cis %>%
+  mutate(model = fct_rev(model)) %>%
+  filter(model != "zinb") %>%
+  plot_cis2("Regression of venesection counts", subtitle=sprintf("n=%i", nrow(m))) +
+  #geom_point(data = tibble(x=c(0.3, 0.5, 1.5, 2), y=1.5), mapping=aes(x, y), inherit.aes = FALSE) +
+  labs(x="Incidence ratio") + #theme_minimal() + 
+  facet_wrap(~ component, scales = "free_x") +
+  scale_color_discrete(breaks=mylevels) +
+  #scale_x_log10(minor_breaks=c(1.5, 2.0)) + #+ theme_classic() + lims(x=c(0.25, 30))
+  theme(legend.position="bottom")
+if (save_figs) {
+  filename <- file.path(figure_path, "progression_cis.pdf")
+  ggsave(filename, g, width=7, heigh=7)
+}
+g
+```
+
+### Probabilities
+
+#### Mixture model
+
+These probabilities use both components of the zero-inflation model.
+
+```{r}
+get_probabilities <- function(fit) {
+  max_count <- max(fit$y)
+  if ("zeroinfl" %in% class(fit)) {
+    tmp <- predict(fit, type="prob") %>% as_tibble()  # Includes both zero and count components
+  } else if ("negbin" %in% class(fit)) {
+    theta <- fit$theta
+    tmp <- map(0:max_count, function(k) dnbinom(k, mu = fitted(fit), size = theta)) %>% bind_cols()
+    colnames(tmp) <- 0:max_count
+  } else {
+    tmp <- map(0:max_count, function(k) dpois(k, lambda = fitted(fit))) %>% bind_cols()
+    colnames(tmp) <- 0:max_count
+  }
+  tmp
+}
+```
+
+```{r}
+# Plots the probability distribution of counts for each individual.
+# Specifying n chooses only the first n individuals
+plot_probabilities <- function(fit, model, n = Inf) {
+  max_n <- length(fit$y) # How many individuals in total
+  max_count <- max(fit$y)
+  tmp <- get_probabilities(fit)
+  tmp2 <- tmp %>% mutate(id = 1:n()) %>% pivot_longer(cols=-id, names_to = "count", values_to = "probability") %>% mutate(count = as.numeric(count))
+  tmp2 <- tmp2 %>% 
+    filter(id <= n) %>% 
+    mutate(id = as.factor(id)) 
+  tmp2 %>% 
+    ggplot(aes(count, probability, #color=id, 
+               group=id)) + 
+    (if (is.infinite(n)) geom_line(alpha = 0.1) else geom_line(aes(color = id))) +
+    labs(y="probability", title=model, subtitle=sprintf("%i individuals", n_distinct(tmp2$id)))
+}
+```
+
+All individuals. These seem to be taking too much memory, so I disabled them.
+
+```{r, eval=FALSE}
+g1 <- plot_probabilities(fit_poisson, "Poisson")
+```
+
+
+```{r, eval=FALSE}
+#g2 <- plot_probabilities(fit_nb, "Negative binomial")
+```
+
+
+```{r, eval=FALSE}
+g3 <- plot_probabilities(fit_zip, "Zero-inflated Poisson")
+```
+
+
+```{r, eval=FALSE}
+g4 <- plot_probabilities(fit_zinb, "Zero-inflated negative binomial")
+```
+
+
+```{r, eval=FALSE}
+g1 + #g2 + 
+  g3 + g4 + plot_layout(guides = "collect")
+```
+
+First five individuals.
+
+```{r}
+g1 <- plot_probabilities(fit_poisson, "Poisson", n = 5)
+#g2 <- plot_probabilities(fit_nb, "Negative binomial", n = 5)
+g3 <- plot_probabilities(fit_zip, "Zero-inflated Poisson", n = 5)
+g4 <- plot_probabilities(fit_zinb, "Zero-inflated negative binomial", n = 5)
+g1 + #g2 + 
+  g3 + g4 + plot_layout(guides = "collect")
+```
+
+```{r}
+rm(g1, g2, g3, g4)
+```
+
+#### Zero model
+
+The zinb2 fitting failed to get std errors, so no wonder the following plot looks a mess.
+
+```{r}
+zero_probabilities <- tibble(zip2 = predict(fit_zip2, type="zero"), zinb2 = predict(fit_zinb2, type="zero"))
+g1 <- zero_probabilities %>% ggplot(aes(zip2, zinb2)) + 
+  geom_abline(slope=1, intercept = 0, color="red") +
+  geom_point() + labs(title="Zero model probabilities")
+g2 <- zero_probabilities %>% 
+  pivot_longer(cols=everything(), names_to="model", values_to="probability") %>% 
+  ggplot(aes(probability, color=model)) + 
+  geom_freqpoly() +
+  labs(title="Zero model probability")
+g1 + g2
+```
+
+
+### Counts
+
+#### Expected counts
+
+Observed zeros and expect number of zeros predicted by models.
+
+```{r}
+round(c("Observed" = sum(m$n < 1),
+        "Poisson"  = sum(dpois(0, fitted(fit_poisson))),
+#        "NB"   = sum(dnbinom(0, mu = fitted(fit_nb), size = fit_nb$theta)),
+        "ZIP"  = sum(predict(fit_zip, type = "prob")[,1]),
+        "ZINB" = sum(predict(fit_zinb, type = "prob")[,1]),
+        "ZIP2"  = sum(predict(fit_zip2, type = "prob")[,1]),
+        "ZINB2" = sum(predict(fit_zinb2, type = "prob")[,1])
+        ))
+```
+
+
+```{r}
+get_expected_counts <- function(fit) {
+  tmp <- get_probabilities(fit)
+  tmp2 <- tmp %>% 
+    summarise(across(everything(), sum)) %>% 
+    as.list() %>% enframe() %>% unnest(value) %>% 
+    rename(count=name, expected_count=value) %>% 
+    mutate(count = as.numeric(count))
+  tmp2
+}
+tmp <- list(poisson=fit_poisson, #nb=fit_nb, 
+            zip=fit_zip, zinb=fit_zinb, zip2=fit_zip2, zinb2=fit_zinb2) %>%
+  map(get_expected_counts) %>% 
+  bind_rows(.id="model")
+tmp %>% pivot_wider(names_from=model, values_from=expected_count)
+observed_counts <- m %>% count(n) %>% rename(count = n, expected_count = nn) %>% mutate(model = "observed")
+expected_counts <- bind_rows(tmp, observed_counts) %>%
+  mutate(model = factor(model, levels=c("observed", mylevels)))
+expected_counts %>% 
+  ggplot(aes(count, expected_count, color=model, group=model)) + 
+  geom_line() + lims(x=c(0, 40)) +
+  guides(color = guide_legend(override.aes = list(linewidth = 2) ) ) +
+  labs(title="Expected number of counts")
+```
+
+
+#### Predicted counts
+
+```{r}
+result_poisson <- augment(fit_poisson, type.predict = "response") %>% select(n, poisson=.fitted)
+#result_nb <- augment(fit_nb, type.predict = "response") %>% select(nb=.fitted)
+#result_nb <- predict(fit_nb, type="response")
+result_zip <- predict(fit_zip)
+result_zinb <- predict(fit_zinb)
+result <- bind_cols(result_poisson, #nb=result_nb, 
+                    zip = result_zip, zinb = result_zinb)
+result <- result %>% pivot_longer(cols=everything())
+```
+
+```{r}
+tmp <- result %>% 
+  mutate(name = factor(name, levels=c("poisson", "nb", "n", "zip", "zinb"))) %>%
+  #mutate(value = round(value)) %>%
+  mutate(value = as.integer(value))
+tmp %>%
+  ggplot(aes(value)) + 
+  #geom_histogram(position="dodge") + 
+  geom_bar(position="dodge") + 
+  lims(x=c(-1, 50)) +   # For some reason, if lower limit is zero, then the zero isn't shown
+  #scale_fill_discrete(labels=c("Predicted", "Observed")) + #, values=c(".fitted", "n")) +
+  labs(x="Number of operations", fill=NULL) +
+  facet_wrap(~name)
+```
+
+Note, that the above figure model counts tell, for example, for how many individuals count zero was predicted, which is not the same 
+as the expected number of zeros.
+
+```{r}
+result %>% ggplot(aes(value, color=name)) + 
+  #geom_histogram() + 
+  geom_density(key_glyph = "path") +
+  #scale_color_discrete(labels=c("Observed", "NB", "Poisson")) + #, values=c(".fitted", "n")) +
+  labs(x="Number of operations", color=NULL) +
+  #facet_wrap(~ name, scale="free_x") + 
+  #scale_y_log10()
+  NULL
+```
+
+After we removed the restriction to cases, this plot came more uninformative.
+
+
+
+
+
+
+
+
+
+
+

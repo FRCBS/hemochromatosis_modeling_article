@@ -1,0 +1,5388 @@
+---
+title: "Hemochromatosis model in FinnGen"
+author: Jarkko Toivonen
+date: "`r Sys.Date()`"
+execute:
+  keep-md: true
+format: 
+  html:
+    df-print: kable
+    toc: true
+    toc-depth: 4
+    embed-resources: true
+  gfm: default
+---
+
+## NOTES
+
+* HC follow-up is 1.5 years longer than donation follow-up (which is from R11)
+
+## Setup
+
+```{r setup}
+# This is needed by tidymodels
+#install.packages("/finngen/green/sfd_0.1.0.tar.gz")
+#install.packages(c("tidyverse", "glue", "glmnet", "broom", "patchwork", "car", "bayesplot", "ggridges",
+#                   "tictoc", "performance", "survminer", "tidymodels))
+library(tidyverse)
+library(glue)
+library(glmnet)
+library(broom)
+library(patchwork)
+library(car)
+# install.packages(c("/finngen/green/jarkko_upload/vip_0.4.1.tar.gz",
+#                    "/finngen/green/fmsb_0.7.5.tar.gz"),
+#                    repos=NULL)
+library(vip)
+library(fmsb)
+# These are needed for bayesian
+# install.packages(c("shiny", "DT", "xts", "miniUI", "packrat", "RcppParallel", "StanHeaders", "inline", "loo",
+#                    "BH", "rstan", "brms"))
+# Maybe some of the below packages are also available from local CRAN. Check before running the command!
+# install.packages(c("/finngen/green/nleqslv_3.3.5.tar.gz",
+#                    "/finngen/green/Brobdingnag_1.2-6.tar.gz",
+#                    "/finngen/green/bridgesampling_1.1-2.tar.gz",
+#                    "/finngen/green/shinyjs_2.1.0.tar.gz",
+#                    "/finngen/green/colourpicker_1.1.1.tar.gz",
+#                    "/finngen/green/dygraphs_1.1.1.6.tar.gz",
+#                    "/finngen/green/threejs_0.3.3.tar.gz",
+#                    "/finngen/green/rsconnect_0.8.25.tar.gz",
+#                    "/finngen/green/shinythemes_1.2.0.tar.gz",
+#                    "/finngen/green/rstantools_2.1.1.tar.gz",
+#                    #"/finngen/green/rstan_2.21.8.tar.gz",   # Apparently this is available from local CRAN
+#                    "/finngen/green/shinystan_2.5.0.tar.gz",
+#                    #"/finngen/green/brms_2.16.3.tar.gz",    # Apparently this is available from local CRAN
+#                    "/finngen/green/jarkko_upload/bayesian_1.0.1.tar.gz"),
+#                  repos=NULL)
+library(bayesian) #
+library(tidymodels)
+#install.packages("/finngen/green/jarkko_upload/broom.mixed_0.2.9.5.tar.gz", repos=NULL)
+library(broom.mixed)
+library(bayesplot)
+library(ggridges)
+library(tictoc)
+library(performance)
+library(survival)    # Installed by default
+library(survminer)
+# These packages are dependencies for detectseparation
+# install.packages("pkgload")
+# install.packages(c("/finngen/green/registry_0.5-1.tar.gz",
+#                    "/finngen/green/slam_0.1-50.tar.gz",
+#                    "/finngen/green/ROI_1.0-0.tar.gz",
+#                    "/finngen/green/lpSolveAPI_5.5.2.0-17.7.tar.gz",
+#                    "/finngen/green/ROI.plugin.lpsolve_1.0-1.tar.gz")
+#                  , repos=NULL)
+library(detectseparation)
+# These are dependencies for shapviz
+# install.packages(c("/finngen/green/shades_1.4.0.tar.gz",
+#                    "/finngen/green/ggfittext_0.10.2.tar.gz",
+#                    "/finngen/green/gggenes_0.5.1.tar.gz",
+#                    "/finngen/green/xgboost_1.7.8.1.tar.gz",
+#                    "/finngen/green/shapviz_0.9.6.tar.gz"
+#                    ),
+#                  repos=NULL)
+
+library(shapviz)
+# install.packages("DiagrammeR")
+# install.packages("/finngen/green/jarkko_upload/exclude_0.0.1.9000.tar.gz")
+library(exclude) #
+# These are dependencies for ciTools
+# install.packages(c("/finngen/green/jarkko_upload/coda_0.19-4.1.tar.gz",
+#                    "/finngen/green/arm_1.14-4.tar.gz",
+#                    "/finngen/green/ciTools_0.6.1.tar.gz"), repos=NULL)
+library(ciTools)
+#install.packages("mboost")
+#install.packages(c("/finngen/green/jarkko_upload/censored_0.3.2.tar.gz"), repos=NULL)
+library(censored) #
+#install.packages(c("statmod", "tableone", "forestplot"))
+library(forestplot)
+library(tableone)
+library(gtsummary)
+library(statmod)     # For quantile residuals
+library(probably)    # For calibration plots
+
+library(logistf)     # For Firth penelized logistic regression for small datas with imbalanced binary response
+
+#install.packages("ranger)
+source("common.R")
+
+# This can measure time a chunk took to execute.
+# Add chunk option time_it=TRUE to each chunk your want to measure.
+knitr::knit_hooks$set(time_it = local({
+  now <- NULL
+  function(before, options) {
+    if (before) {
+      # record the current time before each chunk
+      now <<- lubridate::now()
+    } else {
+      # calculate the time difference after a chunk
+      res <- lubridate::now() - now
+      # return a character string to show the time
+      msg <- sprintf("Time for this code chunk to run: %.2f %s", as.numeric(res), units(res))
+      message(msg)
+      NULL   # Don't return the message so that it won't be printed to the resulting document.
+      msg
+    }
+  }
+}))
+knitr::opts_chunk$set(echo=TRUE, time_it=TRUE)
+
+
+#bgenix <- "~/progs/bgen.tgz/build/apps/bgenix"
+bgenix <- "~/usr/bin/bgenix"
+
+release <- "r13"; Release <- str_to_upper(release)
+
+result_path <- file.path("../results", release)
+cat(sprintf("result_path=%s", result_path), 
+    sprintf("release=%s", release),
+    sep = "\n",
+    file = "../data/bash_init")  # Store the variables for bash chunks
+
+#result_path <- "../results"
+data_path <- "../data"
+table_path  <- file.path(result_path, "tables")
+figure_path <- file.path(result_path, "figures")
+model_path  <- file.path(result_path, "models")
+c(figure_path, table_path, model_path) %>% purrr::discard(dir.exists) %>% walk(~dir.create(., recursive = TRUE))  # Create dirs if they don't exist
+
+boot.n <- 2000
+recompute <- FALSE
+recompute_bayes <- FALSE
+save_figs <- TRUE
+save_tables <- TRUE
+
+credible_snip_names <- c("credible1", "credible2", "credible3")
+known_snip_names <- c("H1_2", "H63D", "S65C", "C282Y", "supersnip")
+hla_snip_names <- c("rs114179634", "rs9261354", "rs3094093")
+interacting_snip_names <- sprintf("int%i", 1:67)
+# options(repos = "file:///usr/finngen-repos/cran/source")
+
+
+```
+
+Specify what performance measures we want to compute. Note the specification of the event_level.
+
+```{r}
+mymetrics <- metric_set(accuracy, kap, mn_log_loss, ppv,
+                        yardstick::metric_tweak("roc_auc", roc_auc, event_level = "second"), 
+                        yardstick::metric_tweak("pr_auc",   pr_auc, event_level = "second"),
+                        yardstick::metric_tweak("brier_class", brier_class, event_level = "second")
+                        )
+# This is for xgboost as it has its response coded the other way ("case" is the first level of hemochromatosis)
+mymetrics_rev <- metric_set(accuracy, brier_class, kap, mn_log_loss, ppv,
+                        roc_auc, pr_auc)
+```
+
+## Functions
+
+### Miscellaneous
+
+```{r}
+print_formula <- function(model) {
+  model %>% extract_fit_engine() %>% formula() %>% deparse1() %>% cat("\n")
+}
+create_sex2 <- function(sex, age) {
+  factor(case_when(sex == "male" ~ "male",
+                   age <= 50     ~ "pre",
+                   age > 50      ~ "post"),
+         levels=c("male", "pre", "post"))
+}
+```
+
+
+### Old stuff
+
+```{r}
+# These are old, don't use!
+
+# It seems that the number of replicates must be at least as high as the number of rows in the dataframe
+# https://stat.ethz.ch/pipermail/r-help/2011-February/269006.html
+# boot.n is the number of bootstrap replications, if null use as many replications as there are rows in the dataframe
+precision_recall_ci <- function(df, method="norm", boot.n=NULL) {
+  
+  get_aupr <- function(df, indices) {
+    df2 <- df[indices,]
+    pb$tick()  # update progress bar
+    aupr <- PRROC::pr.curve(scores.class0=df2$score, weights.class0=df2$original_label)$auc.davis.goadrich
+    return(aupr)
+  }
+    
+  df <- df %>% select(original_label, score)
+  if (is.null(boot.n)) {
+    boot.n <- nrow(df)
+  }
+  
+  pb <- progress::progress_bar$new(total = boot.n+1)# init progress bar
+  pb$tick(0)
+  #p <- progress_estimated(n+1)  # init progress bar
+  #b <- boot(df, statistic = get_aupr, R=boot.n, sim="ordinary", stype="i", strata=df$original_label, parallel="multicore")#, ncpus=1)
+  b <- boot::boot(df, statistic = get_aupr, R=boot.n, sim="ordinary", stype="i", strata=df$original_label, parallel="no")#, ncpus=1)
+  ret <- tryCatch(
+    error = function(cnd) return(-1),
+    {
+      result <- boot::boot.ci(b, conf=0.95, type=method)
+      var <- recode(method, "norm"="normal", "perc"="percent", "stud"="student")  # The name of the output field is stupidly sometimes not the same as the parameter name
+      ci <- if (method=="norm") result[[var]][2:3] else result[[var]][4:5]
+      NULL
+    })
+  if (!is.null(ret) && ret == -1) {
+    ci <- C(NA, NA)
+  }
+  return(list(ci=ci, result=result))
+}
+  
+create_precision_recall_new <- function(original_label, score, method="norm", boot.n=2000) {
+  debug <- FALSE
+  #message("Computing the precision-recall curve")
+  pr_model     <- PRROC::pr.curve(scores.class0=score, weights.class0=original_label, curve=TRUE, rand.compute=TRUE)
+  if (debug) message("hep1")
+  points <- data.frame(pr_model$curve)
+  if (debug) message("hep2")
+  AUPR <- pr_model$auc.davis.goadrich
+  df <- tibble(original_label=original_label, score=score)
+  if (debug) message("hep3")
+  prci <- precision_recall_ci(df, method=method, boot.n=boot.n)$ci
+  if (debug) message("tassa1")
+  title <- "Precision-recall"
+  m <- mean(original_label)
+  if (debug) message("tassa2")
+  pr_plot <- ggplot(points, aes(x=X1,y=X2)) +
+    geom_hline(aes(yintercept=m), color="lightgray") +   # theoretical PR curve of random classifier
+    annotate(geom="text", label=sprintf("y=%.2f", m), x=0.25, y=m, vjust=-1) +
+    geom_line() +
+    annotate(geom="text", label=sprintf("AUPR: %.2f (%.2f%.2f)", AUPR, prci[1], prci[2]), x=0.5, y=0.875) +
+    scale_y_continuous(limits=c(0.0, 1.0)) +
+    labs(x="Recall",y="Precision", title=title)
+  if (debug) message("tassa3")
+  ci <- tibble("AUPR value"=AUPR, "AUPR low"=prci[1], "AUPR high"=prci[2])
+  if (debug) message("tassa4")
+  return(list(pr_plot=pr_plot, pr=points, pr_auc=AUPR, pr_ci=ci))
+}
+
+```
+
+### Performance measures
+
+```{r}
+extract_predictions <- function(fit, new_data=NULL, parameters = NULL) {
+  if (length(intersect(c("resample_results", "tune_results"), class(fit))) > 0) {
+    pred <- fit %>%
+      collect_predictions(parameters = parameters)
+  } else {
+    # Predict on the new data
+    pred <- 
+      fit %>% 
+      augment(new_data)
+  }
+  pred
+}
+  
+# Draws ROC and PR curves using either new_data or resamples
+performance_curves <- function(fit, method, new_data=NULL, parameters = NULL, event_level = "second") {
+  
+  pred <- extract_predictions(fit, new_data, parameters)
+  
+  # Areas under the curves
+  auroc <- pred %>% roc_auc(hemochromatosis, .pred_case, event_level = event_level) %>% pull(.estimate) %>% sprintf("AUROC=%.2f", .)
+  aupr  <- pred %>% pr_auc(hemochromatosis, .pred_case, event_level = event_level)  %>% pull(.estimate) %>% sprintf("AUPR=%.2f", .)
+  
+  # ROC curve
+  g1 <- pred %>%
+    roc_curve(hemochromatosis, .pred_case, event_level = event_level) %>% 
+    autoplot() +
+    annotate(geom = "text", x=0.25, y=0, label=auroc) +
+    labs(title=method, subtitle="ROC")
+         
+         # PR curve
+  g2 <- pred %>%
+    pr_curve(hemochromatosis, .pred_case, event_level = event_level) %>% 
+    autoplot() +
+    annotate(geom = "text", x=0.25, y=0, label=aupr) +
+    labs(title=method, subtitle="PR")
+  return(list(g1, g2))
+}
+```
+
+### Risk table
+
+
+
+
+
+
+Old version.
+
+```{r}
+risk_table <- function(lf, newdata, important_predictors, filename, title=NULL, n=16, conf.level = 0.95) {
+  result <- compute_risk_cis(lf, newdata, important_predictors, count_data = train, conf.level = conf.level)
+  result <- result %>%
+    filter(n >= 5) %>%
+    arrange(desc(mean))
+  if (save_figs) {
+    #png(filename, width=7, height=7, units="in", res=300)
+    pdf(filename, width=12, height=7, title=basename(filename))
+  }
+
+
+  
+  important_predictors2 <- c(important_predictors, 
+                             Probability="probability", `Train count`="n")
+  variables <- important_predictors2 %>% unname()
+  header <- important_predictors2 %>% swap_names_and_values() # forestplot wants these in stupid order
+  rlang::inject(  # forestplot function does not support injection operators !! and !!!
+                  # Wrapping the whole pipeline in inject call makes them work.
+  p <- result %>% 
+    slice_max(order_by = mean, n=n) %>%
+    mutate(probability = sprintf("%.3f", mean)) %>%
+    forestplot(labeltext =  !!variables,  
+               boxsize = 0.2,
+               title = title,
+               new_page = FALSE,
+               xlab = "Hemochromatosis probability") %>%
+    fp_add_lines() %>%
+    fp_add_header(!!!header) %>% 
+    # fp_add_header(sex2 = "Sex2",
+    #               H63D = "H63D",
+    #               C282Y = "C282Y",
+    #               supersnip = "HLA3",
+    #               probability = "Probability",
+    #               n = "Train count")) %>%
+    fp_set_zebra_style("#EFEFEF")
+  )
+  if (save_figs) {
+    print(p)
+    dev.off()
+  }
+  list(p=p, result=result)
+}
+```
+
+Combined effect of C282Y and HLA3.
+
+```{r}
+# cis is a dataframe of effect sizes
+C282Y_plus_HLA3 <- function(cis) {
+  helper <- function(cis) { function(variable) { cis %>% filter(term == variable) %>% pull(estimate)} }
+  f <- helper(cis)   # Function f gets the effect size of a variable from the cis dataframe
+  tribble(
+    ~C282Y, ~HLA3, ~`odds ratio`,
+    0, 0, 1,
+    0, 1, f("supersnip"),
+    0, 2, f("supersnip")**2,
+    1, 0, f("C282Y_X1"),
+    1, 1, f("C282Y_X1") * f("supersnip")    * f("C282Y_X1_x_supersnip"),
+    1, 2, f("C282Y_X1") * f("supersnip")**2 * f("C282Y_X1_x_supersnip")**2,
+    2, 0, f("C282Y_X2"),
+    2, 1, f("C282Y_X2") * f("supersnip")    * f("C282Y_X2_x_supersnip"),
+    2, 2, f("C282Y_X2") * f("supersnip")**2 * f("C282Y_X2_x_supersnip")**2,
+  )
+}
+```
+
+### More old stuff
+
+
+```{r, eval=FALSE}
+# THIS DOES NOT WORK! I WANT TO SUM IN PROBABILITY SCALE, NOT IN LINK SCALE!
+# Compute confidence intervals for the sum of responses in dataframe X2
+confidence_interval_of_sum <- function(fit, X1, key, conf.level=0.95) {
+  Vb <- vcov(fit)            # Variance-covariance matrix of regression coefficients
+  X <- model.matrix(delete.response(terms(fit)), X1)
+  Vy <- X %*% Vb %*% t(X)    # Variance-covariance matrix of predictions
+  sum_of_estimates <- sum(predict(fit, newdata=X1, type="link"))
+  # See https://stackoverflow.com/a/39338512 for how to compute standard error (and confidence interval)
+  # for sum of predictions.
+  variance_of_sum <- sum(Vy)
+  alpha <- conf.level
+  Qt <- c(-1, 1) * qt((1 - alpha) / 2, fit$df.residual, lower.tail = FALSE)
+  #[1] -2.048407  2.048407
+  
+  ## %95 CI
+  cis <- sum_of_estimates + Qt * sqrt(variance_of_sum)
+  names(cis) <- c("lower", "upper")
+  cis <- plogis(c(mean=sum_of_estimates, cis))   # Logistic function. Converts to probability
+  bind_cols(
+    as_tibble_row(cis),
+    key
+  )
+}
+```
+
+
+```{r, eval=FALSE}
+# This computes confidence intervals for risks of sums of observations
+sum_risk_table <- function(lf, newdata, counts, important_predictors, filename, title=NULL, n=16) {
+  variables <- important_predictors %>% unname()
+  ##fit <- lf %>% extract_fit_engine()
+  
+  
+  confidence_helper <- function(lf, group, key) {
+    baked <- lf %>% extract_recipe() %>% bake(group)
+    confidence_interval_of_sum(lf %>% extract_fit_engine(), baked, key)
+  }
+  prediction_cis <- newdata %>%
+    mutate(donation_bin = cut(donations_in_five_years, breaks = donation_breaks, right=FALSE)) %>%
+    group_by(across(all_of(variables))) %>%
+    group_map(function(group, key) confidence_helper(lf, group, key),
+              .keep = TRUE) %>%
+    bind_rows()
+  
+  # Compute confidence intervals for predictions
+  # Note: We use confidence interval instead of prediction intervals, since for logistic regression
+  # prediction intervals could only be [0,0], [1,1] or [0,1].
+  # Same would apply for Poisson regression as well.
+  # Confidence intervals don't have this problem as they are for the mean, not for a single observation.
+
+  # prediction_cis <- lf %>%
+  #   extract_recipe() %>%
+  #   bake(newdata) %>% 
+  #   ciTools::add_ci(fit, names = c("lower", "upper"), yhatName = "mean", alpha = 0.05) %>%
+  #   mutate(type = "parametric") %>% 
+  #   as_tibble()
+  # counts <- train %>% count(across(all_of(variables)))
+  result <- 
+    # bind_cols(
+    #   newdata %>% select(all_of(variables)),
+    #   prediction_cis %>% select(mean, lower, upper)) %>% 
+    prediction_cis %>%
+    left_join(counts, by=variables) %>%
+    replace_na(list(n=0)) %>%
+    filter(n >= 5) %>%
+    arrange(desc(mean))
+  if (save_figs) {
+    pdf(filename, width=12, height=7, title=basename(filename))
+  }
+
+  important_predictors2 <- c(important_predictors, 
+                             Probability="probability", `Train count`="n")
+  variables2 <- important_predictors2 %>% unname()
+  header <- important_predictors2 %>% swap_names_and_values() # forestplot wants these in stupid order
+  rlang::inject(  # forestplot function does not support injection operators !! and !!!
+                  # Wrapping the whole pipeline in inject call makes them work.
+    p <- result %>% 
+      slice_max(order_by = mean, n=n) %>%
+      mutate(probability = sprintf("%.6f", mean)) %>%
+      forestplot(labeltext =  !!variables2,  
+                 boxsize = 0.2,
+                 title = title,
+                 new_page = FALSE,
+                 xlab = "Hemochromatosis probability") %>%
+      fp_add_lines() %>%
+      fp_add_header(!!!header) %>% 
+      fp_set_zebra_style("#EFEFEF")
+  )
+  #g
+  if (save_figs) {
+    print(p)
+    dev.off()
+  }
+  list(p=p, result=result)
+}
+```
+
+
+## Load data 
+
+### All data
+
+```{r}
+L <- readRDS(file.path(result_path, "all_datas.rds"))
+```
+
+
+
+### Prior diseases
+
+```{r}
+filename <- file.path(result_path, "prior_disease_events.tsv")
+prior_disease_events <- read_tsv(filename)
+disease_names <- setdiff(colnames(prior_disease_events), "sample")
+```
+
+These are either 1 or 5 years before the first HC diagnosis, depending on the disease. See the top10 table in the
+finngen_explore.html.
+
+### FinnGen hemochromatosis credible snips
+
+```{r}
+filename <- file.path(data_path, "credible_snip_info.tsv")
+credible_snip_info <- read_tsv(filename)
+```
+
+Read dosages.
+
+```{r}
+filename <- file.path(table_path, "tidy_credible.dosages.tsv.gz")
+credible_snips <- read_tsv(filename, show_col_types = FALSE)
+credible_snip_names <- c("credible1", "credible2", "credible3")
+credible_snips %>% select(-sample) %>% mutate(across(everything(), as.factor)) %>% summary()
+```
+
+### Significant snips from HLA area
+
+
+```{r}
+filename <- file.path(data_path, "hla_snip_info.tsv")
+hla_snip_info <- read_tsv(filename)
+```
+
+
+
+
+Read dosages.
+
+```{r Read dosages2}
+filename <- file.path(table_path, "tidy_hla_dosages.tsv.gz")
+if (! file.exists(filename)) {
+  tmp <- read_delim(output, delim=" ", col_types = cols(position = col_integer(), .default = col_character()))
+  tmp <- tmp %>% 
+    select(-c(chromosome, rsid, position, alleleA, alleleB)) %>% 
+    inner_join(hla_snip_info %>% select(SNPID, rsid), by="SNPID") %>%
+    select(-SNPID) %>%
+    pivot_longer(cols=-c("rsid"), names_to = "sample", values_to = "dosage") %>% 
+    mutate(dosage = as.integer(dosage)) #%>%
+  #inner_join(credible_snips %>% select(SNPID="locus_id", name), by="SNPID")
+  #dosages_wide <- dosages %>% pivot_wider(names_from=name, values_from=dosage, id_cols = sample)
+  hla_snips <- tmp %>% pivot_wider(names_from=rsid, values_from=dosage, id_cols = sample)
+  write_tsv(hla_snips, filename)
+} else  {
+  hla_snips <- read_tsv(filename)
+}
+hla_snip_names <- hla_snip_info$rsid
+hla_snips %>% select(-sample) %>% mutate(across(everything(), as.factor)) %>% summary()
+```
+
+
+
+
+
+### Well-known snips from literature
+
+```{r}
+known_snip_info <- tibble::tribble(
+               ~SNPID,       ~name,       ~rsid, ~chromosome, ~position, ~first, ~second,
+  "chr6_26071867_A_C",      "H1-2", "rs9968910",           6,  26071867,    "A",     "C",
+  "chr6_26090951_C_G",      "H63D", "rs1799945",           6,  26090951,    "C",     "G",
+  "chr6_26090957_A_T",      "S65C", "rs1800730",           6,  26090957,    "A",     "T",
+  "chr6_26092913_G_A",     "C282Y", "rs1800562",           6,  26092913,    "G",     "A",
+  "chr6_32636375_A_G", "supersnip", "rs9272324",           6,  32636375,    "A",     "G"
+  )
+#known_snip_names <- known_snip_info$name
+```
+
+Get dosages.
+
+```{r}
+known_snips <- L$dosages %>% pivot_wider(names_from=name, values_from=dosage, id_cols=sample) %>%
+  rename(H1_2="H1-2")
+known_snips %>% select(-sample) %>% mutate(across(everything(), as.factor)) %>% summary()
+```
+
+### Extra snips
+
+```{r}
+extra_snips_info <- tribble(
+  ~SNPID, ~name, ~rsid, ~chromosome, ~pos_hg38, ~first, ~second,
+  "chr6_24111389_T_C", "extra1", "rs1419230", 6, 24111389, "T", "C"
+)
+extra_snips_filename <- "../data/extra.tsv"
+if (! file.exists(extra_snips_filename))
+  write_tsv(extra_snips_info %>% select(SNPID), extra_snips_filename, col_names = FALSE)
+```
+
+Extract the variants.
+
+```{r Extract variants3}
+if (release == "r12") {
+  input <- "/finngen/library-red/finngen_R12/bgen_2.0/data/chrom/finngen_R12_6.bgen"
+} else {
+  input <- "/finngen/library-red/finngen_R13/bgen_1.0/data/chrom/finngen_R13_6.bgen"
+}
+#bgen_base <- "/finngen/library-red/finngen_R12/bgen_2.0/data/chrom"
+#input_bgen <- file.path(bgen_base, "finngen_R12_6.bgen")
+input_sample <- paste0(input, ".sample")
+extra_bgen <- file.path(result_path, "extra.bgen")
+extra_dosage <- file.path(result_path, "extra.dosage")
+
+# Use bgenix, it is faster
+cmd <- glue("{bgenix} -g {input} -incl-rsids {extra_snips_filename} > {extra_bgen}")
+
+print(cmd)
+if (!file.exists(extra_bgen)) {
+  system(cmd)
+}
+# Create the index
+cmd <- glue("{bgenix} -g {extra_bgen} -index")
+print(cmd)
+if (!file.exists(paste0(extra_bgen, ".bgi"))) {
+  system(cmd)
+}
+```
+
+qctool took 9m16.454s
+bgenix took 0m4.236s
+
+Convert bgen to dosage file.
+
+```{r Extract dosages3}
+cmd <- glue("qctool -g {extra_bgen} -og {extra_dosage} -ofiletype dosage -incl-snpids {extra_snips_filename}")
+print(cmd)
+if (!file.exists(extra_dosage)) {
+  system(cmd)
+}
+```
+
+Read dosages.
+
+```{r Read snip dosages}
+extra_snips <- read_delim(extra_dosage, delim=" ", col_types = cols(position = col_integer(), .default = col_character()))
+extra_snips <- extra_snips %>% 
+  select(-c(chromosome, rsid, position, alleleA, alleleB)) %>% 
+  pivot_longer(cols=-c("SNPID"), names_to = "sample", values_to = "dosage") %>% 
+  mutate(dosage = as.integer(dosage)) %>%
+  inner_join(extra_snips_info %>% select(SNPID, rsid, name), by="SNPID")
+extra_snips_wide <- extra_snips %>% pivot_wider(names_from=name, values_from=dosage, id_cols = sample)
+```
+
+### All snips
+
+Combine all snip information in a table
+```{r}
+all_snip_info <- bind_rows(
+  known_snip_info %>% rename(ref = first, alt = second, pos_hg38 = position),
+  credible_snip_info %>% rename(ref = first, alt = second),
+  hla_snip_info %>% rename(chromosome = chrom)
+) %>% select(SNPID, name, rsid, chromosome, pos_hg38, ref, alt)
+if (save_tables)
+  write_tsv(all_snip_info, file.path(table_path, "all_snip_info.tsv"))
+all_snip_info
+```
+
+### Interacting snips
+
+Extract the variants with bgenix.
+
+```{r Extract variants 4}
+#bgen_base <- "/finngen/library-red/finngen_R12/bgen_2.0/data/chrom"
+input_bgen <- if (release == "r12") "/finngen/library-red/finngen_R12/bgen_2.0/data/chrom/finngen_R12_6.bgen" else "/finngen/library-red/finngen_R13/bgen_1.0/data/chrom/finngen_R13_6.bgen"
+input_sample <- paste0(input_bgen, ".sample")
+output <- file.path(result_path, "interacting_snips.dosage")
+
+snip_id_filename <- file.path(result_path, "interacting_snips_ids.tsv")
+cmd <- glue("{bgenix} -g {input_bgen} -incl-rsids {snip_id_filename} | ",
+            "qctool -g - -filetype bgen -og {output} -ofiletype dosage")
+print(cmd)
+if (!file.exists(output)) {
+  system(cmd)
+}
+```
+
+
+
+```{r Read interaction dosages}
+filename <- file.path(table_path, "tidy_interacting.dosages.tsv.gz")
+if (! file.exists(filename)) {
+  input <- file.path(result_path, "interacting_snips.dosage")
+  tmp <- read_delim(input, delim=" ", col_types = cols(position = col_integer(), .default = col_character()))
+  # Cleanup
+  interacting_snip_names <- sprintf("int%i", 1:nrow(tmp))   # 67 snips
+  tmp <- tmp %>% 
+    mutate(name = interacting_snip_names) %>%
+    select(-c(chromosome, rsid, position, alleleA, alleleB)) %>% 
+    #inner_join(credible_snips_info %>% select(SNPID, name), by="SNPID") %>%
+    pivot_longer(cols=-c("SNPID", "name"), names_to = "sample", values_to = "dosage") %>% 
+    mutate(dosage = as.numeric(dosage))
+    # mutate(dosage = as.integer(round(dosage))) #%>%  # no need for round as XGboost is used
+  #inner_join(credible_snips %>% select(SNPID="locus_id", name), by="SNPID")
+  #tmp_wide <- tmp %>% pivot_wider(names_from=name, values_from=dosage, id_cols = sample)
+  interacting_snips <- tmp %>% pivot_wider(names_from=name, values_from=dosage, id_cols = sample)
+  write_tsv(interacting_snips, filename)
+} else {
+  interacting_snips <- read_tsv(filename)
+}
+interacting_snips %>% select(-sample) %>% mutate(across(everything(), as.factor)) %>% summary()
+```
+
+
+### Blood donation data
+
+```{r}
+#filename <- "/finngen/library-red/finngen_R12/analysis_covariates/R12_COV_V2.FID.txt.gz"
+if (release == "r12") {
+  filename <- "/finngen/library-red/finngen_R12/phenotype_1.0/data/finngen_R12_minimum_1.0.txt.gz"
+} else {
+  filename <- "/finngen/library-red/finngen_R13/phenotype_1.0/data/finngen_R13_minimum_1.0.txt.gz"
+}
+dob <- read_tsv(filename, col_select = c(sample=FINNGENID, APPROX_BIRTH_DATE))
+L$hc <- L$hc %>% left_join(dob, by="sample")
+L$hc <- L$hc %>% mutate(approx_event_death_eof_date = as_date(APPROX_BIRTH_DATE + dyears(AGE)))
+# Covariate information is not available for outliers.
+```
+
+```{r}
+if (release == "r12") {
+  #filename <- "/finngen/library-red/finngen_R12/analysis_covariates/R12_COV_V2.FID.txt.gz"
+  filename <- "/finngen/library-red/finngen_R11/analysis_covariates/R11_COV_V0.FID.txt.gz"
+} else {
+  filename <- "/finngen/library-red/finngen_R13/analysis_covariates/data/R13_COV_V0.FID.txt.gz"
+}
+sex_blood <- read_tsv(filename, col_select = c("FID", "SEX", "SEX_IMPUTED")) %>% rename(sample=FID) %>% mutate(across(SEX, as.factor))
+```
+
+```{r}
+if (release == "r12") {
+  filename <- "/finngen/library-red/finngen_R11/phenotype_1.0/data/finngen_R11_minimum_extended_1.0.txt.gz"
+} else {
+  filename <- "/finngen/library-red/finngen_R13/phenotype_1.0/data/finngen_R13_minimum_extended_1.0.txt.gz"
+}
+sex_blood_all <- read_tsv(filename, col_select = c("FINNGENID", "SEX")) %>% rename(sample=FINNGENID) %>% mutate(across(SEX, as.factor))
+```
+
+Read blood donation data.
+
+```{r}
+filename <- if (release == "r12") "/finngen/library-red/finngen_R11/FRCBS_blood_donor_data_1.0/data/finngen_R11_FRCBS_Blood_Donor_Donations_1.0.txt.gz" else "/finngen/library-red/finngen_R13/FRCBS_blood_donor_data/data/finngen_R13_FRCBS_Blood_Donor_Donations_1.0.txt.gz"
+#filename <- "/finngen/library-red/finngen_R11/FRCBS_blood_donor_data_1.0/data/finngen_R11_FRCBS_Blood_Donor_Donations_1.0.txt.gz"
+blood_donations <- read_tsv(filename)
+blood_donations <- blood_donations %>% rename(sample = FINNGENID) %>% mutate(across(BloodDonationTypeKey, as.factor))
+```
+
+Sanity check:
+
+```{r}
+tmp <- blood_donations %>% filter(BloodDonationTypeKey=="Whole_blood_donation") %>% left_join(sex_blood_all, by="sample") %>%
+  mutate(low = (SEX=="female" & Hb < 125) | (SEX=="male" & Hb < 135))
+summary(tmp)
+```
+
+Frequencies when NAs are removed.
+
+```{r}
+tmp %>% group_by(SEX) %>% 
+  summarise(low=mean(low, na.rm=TRUE))
+```
+
+Frequencies when NAs in Hb are considered Hb deferral.
+
+```{r}
+tmp %>% group_by(SEX) %>% 
+  mutate(low = coalesce(low, TRUE)) %>%
+  summarise(low=mean(low))
+```
+
+Last donation is from 2021-12-14.
+
+```{r}
+sprintf("Last donation is from %s\n", max(blood_donations$APPROX_DONATION_DATE))
+```
+
+Whereas the followup ends on 2023-05-15.
+
+```{r}
+sprintf("Followup ends on %s\n", max(L$hc$approx_event_death_eof_date, na.rm=TRUE))
+```
+
+
+
+```{r}
+plot_hb_distributions <- function(blood_donations, sex, title) {
+  donations <- blood_donations %>% filter(BloodDonationTypeKey == "Whole_blood_donation")
+  donations2 <- donations %>% left_join(sex, by="sample")
+  rejected <- donations2 %>% filter(! is.na(Hb)) %>%
+    mutate(rejected=(SEX=="female" & Hb < 125) | (SEX=="male" & Hb < 135) | is.na(Hb))
+  rejected_counts <- rejected %>% group_by(SEX) %>% summarise(n = sum(rejected), fraction=mean(rejected))
+  donations2 %>% 
+    ggplot(aes(Hb, fill=SEX)) + geom_histogram() + 
+    geom_vline(mapping=aes(xintercept=Hb), data=tibble(Hb = c(125, 135), SEX=c("female", "male"))) +
+    geom_text(mapping=aes(x=I(0.0), y=I(0.9), label=sprintf("rejected %i (%.1f%%)", n, fraction*100)), data=rejected_counts, hjust=0) +
+    labs(y="Count", title=title) +
+    facet_grid(~ SEX)
+}
+```
+
+```{r}
+plot_hb_distributions(blood_donations, sex_blood, "Blood donations sex")
+```
+
+```{r}
+plot_hb_distributions(blood_donations, sex_blood_all, "Blood donations sex_R all")
+```
+
+Get number of donations before the first event, death or end of followup.
+Five year window.
+
+```{r}
+x_year_sliding_window_sum <- function(weight, date, x=2) {
+  v <- as.numeric(slider::slide_index(weight, date, sum, .before = lubridate::dyears(x))) # years(2) had problems with leap days
+  return(v)
+}
+```
+
+
+```{r}
+helper <- function(df, key) {
+  if (nrow(df) > 1) {
+    df <- df %>% drop_na(Hb)
+  }
+  if (nrow(df) == 1) {
+    
+  }
+  stopifnot(nrow(df) == 1)
+  df
+}
+statistics <- function(df) { list(donations = nrow(df), donors=n_distinct(df$sample)) }
+filename <- file.path(result_path, "processed_donations.rds")
+if (! file.exists(filename) || recompute) {
+  donations <- blood_donations %>% 
+    #head(10000) %>%
+    init_exclude(statistics = statistics) %>%
+    inner_join(sex_blood_all, by="sample") %>%
+    exclude("Inner join sex") %>%
+    filter(BloodDonationTypeKey == "Whole_blood_donation") %>%
+    exclude("Exclude non-whole-blood-donations") %>%
+    distinct() %>%
+    exclude("Remove duplicate rows") %>%
+    group_by(sample, APPROX_DONATION_DATE) %>%
+    group_modify(helper) %>%
+    ungroup() %>%
+    exclude("Selected one donation per day from a donor") %>%
+    filter(!is.na(Hb)) %>%
+    exclude("Exclude NA Hb values") %>%
+    filter((SEX=="female" & Hb >= 125) | (SEX=="male" & Hb >= 135)) %>%
+    exclude("Exclude hb-deferrals") %>%
+    left_join(dob, by="sample") %>%
+    exclude("Left join date of birth") %>%
+    mutate(donation_age = interval(APPROX_BIRTH_DATE, APPROX_DONATION_DATE)/years(1)) %>%
+    select(-c(BloodDonationTypeKey, APPROX_BIRTH_DATE)) %>%
+    arrange(APPROX_DONATION_DATE) %>%
+    mutate(dummy = 1, across(APPROX_DONATION_DATE, as_datetime))  %>% # For computing the donations in five years
+    group_by(sample) %>%
+    mutate(donations_in_five_years = x_year_sliding_window_sum(dummy, APPROX_DONATION_DATE, x=5)) %>%  # The number includes the current donation
+    ungroup() %>%
+    select(-dummy) %>%
+    mutate(across(APPROX_DONATION_DATE, as_date))
+  saveRDS(donations, filename)
+  exclusions_filename <- file.path(table_path, "donation_exclusions.tsv")
+  e <- get_exclude()
+  donation_exclusions <- as_tibble(e)
+  write_tsv(donation_exclusions, exclusions_filename)
+} else {
+  donations <- readRDS(filename)
+}
+
+
+
+donation_count <- donations %>%
+  inner_join(L$hc %>% select(sample, approx_event_death_eof_date), by="sample") %>%
+  filter(APPROX_DONATION_DATE < approx_event_death_eof_date,
+         APPROX_DONATION_DATE >= approx_event_death_eof_date - dyears(5)) %>%
+  count(sample, name="donations_in_five_years")
+```
+
+
+
+```{r}
+n_distinct(blood_donations$sample)
+n_distinct(donations$sample)
+n_distinct(donation_count$sample)
+```
+
+It seems that large number of donors drop because they have no donations in the two-year window.
+
+### Read end of follow-up age
+
+Read death / end of follow-up age.
+
+```{r}
+if (release == "r12") {
+  filename <- "/finngen/library-red/finngen_R12/analysis_covariates/R12_COV_V2.FID.txt.gz"
+} else {
+  filename <- "/finngen/library-red/finngen_R13/analysis_covariates/data/R13_COV_V0.FID.txt.gz"
+}
+EOF_AGE <- read_tsv(filename, col_select = c("FID", "AGE_AT_DEATH_OR_END_OF_FOLLOWUP")) %>%
+  rename(sample=FID)
+```
+
+
+### Form data
+
+Join data sets.
+
+```{r}
+basic <- L$hc %>%
+  select(sample, hemochromatosis, event_age=AGE, approx_event_date = APPROX_EVENT_DAY, approx_event_death_eof_date) %>%
+  inner_join(L$bd, by="sample") %>%
+  inner_join(L$sex %>% rename(sex=SEX), by="sample") %>%
+  left_join(EOF_AGE, by="sample") %>%  
+  mutate(age = AGE_AT_DEATH_OR_END_OF_FOLLOWUP) %>%
+  mutate(sex2 = create_sex2(sex, age),
+         sex = factor(sex, levels=c("male", "female"))) %>%
+  left_join(prior_disease_events, by="sample") %>%
+  mutate(across(all_of(disease_names), ~ replace_na(., FALSE))) %>%
+  left_join(credible_snips, by="sample") %>%
+  left_join(known_snips, by="sample") %>%
+  left_join(hla_snips, by="sample") %>%
+  left_join(interacting_snips, by="sample") %>%
+  left_join(donation_count, by="sample") %>%
+  replace_na(list(donations_in_five_years=0)) %>%
+  mutate(hemochromatosis = fct_relevel(hemochromatosis, c("control", "case")))
+```
+
+
+```{r}
+basic %>% 
+  select(-sample) %>% 
+  mutate(across(all_of(c(credible_snip_names, known_snip_names, hla_snip_names)), as.factor)) %>% 
+  summary()
+```
+
+```{r}
+filename <- file.path(result_path, "basic.rds")
+if (! file.exists(filename) || recompute) {
+  saveRDS(basic, filename)
+} else {
+  basic <- readRDS(filename)
+}
+```
+
+```{r, eval=FALSE}
+basic <- basic %>% 
+  #select(-(int1:int67)) %>%
+  left_join(EOF_AGE, by="sample") %>%
+  mutate(age = AGE_AT_DEATH_OR_END_OF_FOLLOWUP,
+         sex2 = create_sex2(sex, age))   # We need to recreate this
+```
+
+
+## Split
+
+Divide the data into train and test sets.
+
+```{r}
+seed <- 142
+set.seed(seed)
+helper <- function(n) {
+  v <- rep(c("train", "test"), length.out=n)
+  sample(v, n)
+}
+use_tidymodels <- TRUE
+if (use_tidymodels) {
+  # See
+  # https://github.com/tidymodels/rsample/issues/473
+  basic_split <- basic %>%
+    initial_split(strata = "hemochromatosis", prop = 0.5)   #, pool = 0.0010)  # This causes bias
+  #set.seed(seed)
+  #basic_split_wild <- basic %>%
+  #  filter(C282Y == 0) %>%
+  #  initial_split(strata = "hemochromatosis", prop = 0.5, pool = 0.0010)
+  #initial_validation_split(strata = "hemochromatosis", prop = c(0.6, 0.2))
+  train <- training(basic_split)
+  test  <- testing(basic_split)
+  #train_wild <- training(basic_split_wild)
+  #test_wild  <- testing(basic_split_wild)
+} else {
+  tmp <- basic %>% 
+    group_by(hemochromatosis, sex) %>%
+    mutate(group = helper(n())) %>%
+    ungroup() #%>%
+  #mutate(hemochromatosis = factor(if_else(hemochromatosis == "case", 1, 0)))
+  train <- tmp %>% filter(group=="train") %>% select(-group)
+  test  <- tmp %>% filter(group=="test") %>% select(-group)
+  rm(tmp)
+}
+```
+
+Save training sample ids for HLA hemochromatosis GWAS.
+
+```{r, eval=recompute}
+filename <- file.path(result_path, "training_sample_ids.tsv.gz")
+if (save_tables)
+  write_tsv(train %>% select(FID=sample), filename)
+```
+
+
+```{r}
+sprintf("Train: %i cases, %i controls, %.2f%% prevalence", sum(train$hemochromatosis=="case"), sum(train$hemochromatosis=="control"), mean(train$hemochromatosis=="case")*100)
+sprintf("Test: %i cases, %i controls, %.2f%% prevalence", sum(test$hemochromatosis=="case"), sum(test$hemochromatosis=="control"), mean(test$hemochromatosis=="case")*100)
+```
+
+Opposite response coding for xgboost to get correct effect directions of shap values.
+
+```{r}
+genetic_variables <- c("H63D", "S65C", "C282Y", "supersnip", "credible1", "credible2", "credible3", "rs3094093", "rs114179634")
+xg_train <- train %>% mutate(across(all_of(genetic_variables), as.factor),
+                             hemochromatosis = fct_relevel(hemochromatosis, c("case", "control")))
+xg_test <- test %>% mutate(across(all_of(genetic_variables), as.factor),
+                             hemochromatosis = fct_relevel(hemochromatosis, c("case", "control")))
+```
+
+Form folds for cross-validation.
+
+```{r}
+number_of_folds <- 10
+set.seed(345)
+folds <- vfold_cv(train, v = number_of_folds)
+set.seed(345)
+xg_folds <- vfold_cv(xg_train, v = number_of_folds)
+```
+
+
+## Checking additivity
+
+```{r}
+check_additivity <- function(data, snip, method="glm.fit", covariates=c()) {
+  data2 <- data %>% mutate(additive=.data[[snip]], 
+                           deviation=as.integer(.data[[snip]]==2))
+                           #hemochromatosis = fct_relevel(hemochromatosis, c("control", "case")))
+  s <- glue("hemochromatosis ~ additive + deviation")
+  if (length(covariates) > 0)
+    s <- paste(c(s, covariates), collapse = " + ")
+  f <- as.formula(s)
+  m <- glm(f, data=data2, family = "binomial", method=method)
+  m
+}
+#m <- check_additivity(train, "C282Y")
+```
+
+### Without covariates
+
+```{r}
+tmp <- known_snip_names %>% set_names() %>% 
+  map(function(snip) {
+    check_additivity(train, snip) %>% tidy(conf.int=TRUE, exponentiate=TRUE)
+  })
+additivity_effects <- tmp %>% bind_rows(.id = "snip") %>% filter(term != "(Intercept)")
+```
+
+Why S65C fails?
+
+```{r}
+known_snip_names %>% map(function(snip) train %>% select(hemochromatosis, all_of(snip)) %>% table())
+```
+
+Probably S65C fails because variable S65C==2 decides hemochromatosis status nearly completely, 
+a quasi-complete separation issue.
+
+```{r Detect for separation, eval=FALSE}
+filename <- file.path(model_path, "detect_separation.rds")
+if (! file.exists(filename)) {
+  tic("Detect separation")
+  result_ds <- known_snip_names %>% set_names() %>% 
+    map(function(snip) {
+      check_additivity(train, snip, method="detect_separation")
+    })
+  toc()
+  saveRDS(result_ds, filename)
+} else {
+  result_ds <- readRDS(filename)
+}
+```
+
+detectseparation package also detects separation for the deviation parameter for S65C.
+
+
+```{r}
+plot_additivity_effects <- function(addivity_effects) {
+  additivity_effects %>% 
+    mutate(term = factor(term, levels=c("deviation", "additive")),
+           color = if_else(p.value < 0.05, "red", "black")) %>%
+    ggplot(aes(x=estimate, xmin=conf.low, xmax=conf.high, y=term)) + 
+    geom_vline(xintercept = 1, color="gray") +
+    geom_pointrange() + 
+    geom_text(aes(label=sprintf("p=%.2e", p.value), color=I(color)), hjust=0, nudge_y = 0.25) +
+    facet_wrap(~snip, scales = "free_x")
+}
+```
+
+```{r}
+plot_additivity_effects(addivity_effects)
+```
+
+So, C282Y and H1-2 snips seem to deviate from additive behaviour.
+
+
+```{r}
+which_model <- function(df, snip2) {
+  effect <- df %>% filter(snip==snip2) %>% select(term, estimate) %>% deframe()
+  heterozygote <- effect[["additive"]]
+  homozygote <- effect[["additive"]]**2 * effect[["deviation"]]
+  cat(sprintf("Being heterozygote in %s multiplies odds by %f\n", snip2, heterozygote))
+  cat(sprintf("Being homozygote in %s multiplies odds by %f\n", snip2, homozygote))
+  if (heterozygote < homozygote) {
+    cat(sprintf("Therefore, recessive model should be used for %s\n", snip2))
+  } else {
+    cat(sprintf("Therefore, dominant model should be used for %s\n", snip2))
+  }
+  invisible(NULL)
+}
+```
+
+
+```{r}
+which_model(additivity_effects, "C282Y")
+which_model(additivity_effects, "H1_2")
+```
+
+### With covariates
+
+```{r}
+tmp <- known_snip_names %>% set_names() %>% 
+  map(function(snip) {
+    check_additivity(train, snip, covariates=c("sex", "approx_event_death_eof_date")) %>% 
+      tidy(conf.int=TRUE, exponentiate=TRUE)
+  })
+additivity_effects_with_covariates <- tmp %>% bind_rows(.id = "snip") %>% filter(term != "(Intercept)")
+```
+
+```{r}
+plot_additivity_effects(addivity_effects_with_covariates)
+```
+
+```{r}
+which_model(additivity_effects_with_covariates, "C282Y")
+which_model(additivity_effects_with_covariates, "H1_2")
+```
+
+Adding covariates did not have a large effect.
+
+## Model 0
+
+This is the baseline model.
+
+### Basic logistic model
+
+
+```{r}
+variables0 <- c("sex2", "age",
+                "H63D", "C282Y"
+                )
+f0 <- sprintf("hemochromatosis ~ %s", paste(variables0, collapse=" + "))
+f0
+```
+
+```{r logistic-mod-0}
+logistic_mod_0 <- parsnip::logistic_reg()
+logistic_mod_0
+```
+
+
+```{r logistic_recipe-0}
+logistic_recipe_0 <- 
+  recipe(as.formula(f0), data = train) %>% 
+  step_normalize(age) %>%
+  step_mutate(C282Y = as.factor(C282Y),     # Encode C282Y and H63D as factors
+              H63D  = as.factor(H63D)) %>%
+  step_dummy(all_nominal_predictors(), C282Y, H63D) %>%
+  step_interact(terms = ~ starts_with("C282Y") : c(starts_with("H63D")   )) %>%
+  step_lincomb(all_numeric_predictors()) # Removes variables that have exact linear combinations with others
+logistic_recipe_0
+```
+
+
+```{r logistic-workflow-0}
+logistic_wflow_0 <- 
+  workflow() %>% 
+  add_model(logistic_mod_0) %>% 
+  add_recipe(logistic_recipe_0)
+logistic_wflow_0
+```
+
+This will fit on training data and show performance measures on test data.
+
+```{r last-fit-0}
+filename <- file.path(model_path, "logistic_lf_0.rds")
+if (! file.exists(filename) || recompute) {
+  logistic_lf_0 <- last_fit(logistic_wflow_0, basic_split)  # Needs to be unfitted workflow
+  saveRDS(logistic_lf_0, filename)
+} else {
+  logistic_lf_0 <- readRDS(filename)
+}
+class(logistic_lf_0)
+```
+
+```{r full-fit-0, eval=FALSE}
+filename <- file.path(model_path, "logistic_full_5.rds")
+if (! file.exists(filename) || recompute) {
+  logistic_full_5 <- fit(logistic_wflow_5, basic)  # Needs to be unfitted workflow
+  saveRDS(logistic_full_5, filename)
+} else {
+  logistic_full_5 <- readRDS(filename)
+}
+```
+
+
+
+
+Show trained recipe.
+
+```{r}
+logistic_lf_0 %>% extract_workflow() %>% extract_recipe()
+```
+
+The step_lincomb removed two interactions!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+
+Basic info about the fit.
+
+```{r glance0}
+logistic_lf_0 %>% extract_workflow() %>% glance()
+```
+
+```{r}
+tic()
+par(mfrow = c(2, 2))
+logistic_lf_0 %>% extract_fit_engine() %>% plot()
+toc()
+```
+
+This one uses jackknife deviance residuals.
+
+```{r}
+tic()
+par(mfrow = c(2, 2))
+logistic_lf_0 %>% extract_fit_engine() %>% boot::glm.diag.plots()
+toc()
+```
+
+Try with quantile residuals instead.
+
+```{r}
+constant_information_transformation <- function(fit) {
+  family <- fit$family$family
+  # Constant-information scale transformation of the linear predictor.
+  # See page 308 of Generalized linear models with examples in R
+  transformation <- if (family == "binomial") {
+    function(x) asin(sqrt(x))
+  } else if (family == "poisson") {
+    function(x) sqrt(x)
+  } else if (family == "gamma") {
+    function(x) log(x)
+  } else {
+    function(x) { stop("not implemented") }
+  }
+  transformation  
+}
+# This analyses the random component of a GLM model
+my_diagnostics <- function(fit) {
+  transformation <- constant_information_transformation(fit)
+  par(mfrow = c(2, 2))
+  qr <- qresid(fit)
+  qqnorm(qr, las=1); qqline(qr)
+  plot(qr ~ transformation(fitted(fit)), las=1)   # sin^-1(sqrt(mu)) is the constant-information scale transformation for Binomial distribution    
+  plot(cooks.distance(fit), type="h", las=1)
+  plot(hatvalues(fit), type="h", las=1)
+}
+fit <- logistic_lf_0 %>% extract_fit_engine()
+my_diagnostics(fit)
+```
+
+```{r}
+# These analyse the systematic component of a GLM
+my_diagnostics2 <- function(fit) {
+  transformation <- constant_information_transformation(fit)
+  par(mfrow = c(1, 2))
+  scatter.smooth(rstandard(fit) ~ transformation(fitted(fit)), las=1, 
+                 ylab="Standardized deviance residuals", xlab="log(Fitted values)")
+  z <- resid(fit, type="working") + fit$linear.predictors
+  plot(z ~ fit$linear.predictors, las=1, xlab="Working responses", ylab="Linear predictor")
+  abline(0, 1)
+}
+my_diagnostics2(fit)
+```
+
+
+```{r}
+par(mfrow = c(3, 3))
+termplot(fit, data=fit$data, partial.resid = TRUE, las=1)
+```
+
+```{r}
+logistic_lf_0 %>% extract_workflow() %>% extract_fit_engine() %>% fmsb::NagelkerkeR2()
+```
+
+Variance inflation factors.
+
+```{r logistic-vif-0}
+logistic_lf_0 %>% extract_workflow() %>% extract_fit_engine() %>% car::vif() %>% sort(decreasing = TRUE)
+```
+
+Calibration.
+
+```{r}
+logistic_lf_0_test_pred <- augment(logistic_lf_0)
+logistic_lf_0_test_pred %>%
+  cal_plot_windowed(truth = hemochromatosis, estimate = .pred_case, step_size = 0.025, event_level="second")
+```
+
+
+
+
+```{r logistic-cis-0}
+filename <- file.path(table_path, "logistic_cis_0.tsv")
+if (! file.exists(filename) || recompute) {
+  logistic_cis_0 <- compute_cis(logistic_lf_0 %>% extract_workflow())
+  write_tsv(logistic_cis_0, filename)
+} else {
+  logistic_cis_0 <- read_tsv(filename)
+}
+```
+
+```{r logistic-cis-plot-0}
+#| fig-cap: The age is at first event for cases and at death or EOF for controls.
+filename <- file.path(figure_path, "logistic_cis_0.pdf")
+g <- plot_cis(logistic_cis_0, "Logistic model 0 FinnGen", subtitle=model_stats(logistic_lf_0)) + labs(y="Variable")
+if (save_figs)
+  ggsave(filename, g, width=7, height=7)
+g
+```
+
+```{r logistic-cis-full-0, eval=FALSE}
+filename <- file.path(table_path, "logistic_cis_full_0.tsv")
+if (! file.exists(filename) || recompute) {
+  logistic_cis_full_0 <- compute_cis(logistic_full_0)
+  write_tsv(logistic_cis_full_0, filename)
+} else {
+  logistic_cis_full_0 <- read_tsv(filename)
+}
+```
+
+```{r logistic-cis-full-plot-0, eval=FALSE}
+#| fig-cap: The age is at first event for cases and at death or EOF for controls.
+filename <- file.path(figure_path, "logistic_cis_full_0.pdf")
+g <- plot_cis(logistic_cis_full_0, "Logistic model 0 full FinnGen", subtitle=model_stats(logistic_full_0)) + labs(y="Variable")
+#ggsave(file.path(figure_path, "poster", "logistic_cis_5.pdf"), g + theme(plot.title=element_blank(), axis.title.y.left = element_blank()))
+if (save_figs)
+  ggsave(filename, g, width=7, height=7)
+g
+```
+
+
+### Cox regression
+
+```{r}
+baseline_variables0 <- c("sex2", 
+                        "H63D",
+                        "C282Y", 
+                        "C282Y:H63D")
+variables0_cox <- c(baseline_variables0)
+f0_cox <- as.formula(sprintf("Surv(event_age, hemochromatosis) ~ %s", paste(variables0_cox, collapse=" + ")))
+f0_cox
+```
+
+```{r}
+cox_train <- train %>% mutate(hemochromatosis = as.integer(hemochromatosis == "case"),
+                              across(c(C282Y, H63D), as.factor))
+cox_full <- basic %>% mutate(hemochromatosis = as.integer(hemochromatosis == "case"),
+                              across(c(C282Y, H63D), as.factor))
+```
+
+
+```{r}
+filename <- sprintf("%s/cox_fit_0.rds", model_path)
+if (recompute | !file.exists(filename)) {
+  cox_fit_0 <- survival::coxph(f0_cox, data=cox_train)
+  saveRDS(cox_fit_0, file=filename)
+} else {
+  cox_fit_0 <- readRDS(filename)
+}
+summary(cox_fit_0)
+```
+
+```{r, eval=FALSE}
+filename <- sprintf("%s/cox_full_0", model_path)
+if (recompute | !file.exists(filename)) {
+  cox_full_0 <- survival::coxph(f0_cox, data=cox_full)
+  saveRDS(cox_full_0, file=filename)
+} else {
+  cox_full_0 <- readRDS(filename)
+}
+summary(cox_full_0)
+```
+
+Nothing interesting in this.
+
+```{r}
+g <- survminer::ggsurvplot(survfit(cox_fit_0), cox_train, risk.table = TRUE)
+grid.newpage()
+print(g, newpage=FALSE)
+```
+
+
+
+
+```{r Compute basic Cox model effect sizes 0}
+filename <- sprintf("%s/cox_cis_0.tsv", table_path)
+if (recompute | !file.exists(filename)) {
+  cox_cis_0 <- tidy(cox_fit_0, conf.int = TRUE, exponentiate = TRUE) %>%
+    drop_na(estimate)    # Some interacting levels don't exist in the date, we drop them here
+  write_tsv(cox_cis_0, file=filename)
+} else {
+  cox_cis_0 <- read_tsv(filename)
+}
+```
+
+
+```{r Plot basic Cox model effect sizes 0}
+g <- plot_cis(cox_cis_0, "Cox model 0 FinnGen") +
+  labs(x="Hazard ratio") +
+  theme(axis.title.y = element_blank())
+if (save_figs) {
+  filename <- sprintf("%s/cox_cis_0.png", figure_path)
+  ggsave(filename=filename,  plot=g, width = 180,  height = 120, units="mm", dpi=300, scale=1.0, device="png")
+}
+g
+```
+
+```{r Compute basic full Cox model effect sizes 0, eval=FALSE}
+filename <- sprintf("%s/cox_cis_full_0.tsv", table_path)
+if (recompute | !file.exists(filename)) {
+  cox_cis_full_0 <- tidy(cox_full_0, conf.int = TRUE, exponentiate = TRUE) %>%
+    drop_na(estimate)    # Some interacting levels don't exist in the date, we drop them here
+  write_tsv(cox_cis_full_0, file=filename)
+} else {
+  cox_cis_full_0 <- read_tsv(filename)
+}
+```
+
+
+```{r Plot basic full Cox model effect sizes 0, eval=FALSE}
+g <- plot_cis(cox_cis_full_0, "Cox model 0 full FinnGen") +
+  labs(x="Hazard ratio") +
+  theme(axis.title.y = element_blank())
+if (save_figs) {
+  filename <- sprintf("%s/cox_cis_full_0.png", figure_path)
+  ggsave(filename=filename,  plot=g, width = 180,  height = 120, units="mm", dpi=300, scale=1.0, device="png")
+}
+g
+```
+
+## Model 1
+
+This model is supposed to be comparable to the UKBB model. Cannot split women in to pre and postmenopausal since
+in UKBB age is always at least 40.
+
+```{r}
+variables1 <- c("sex", "age", "H1_2", "H63D", "S65C", "C282Y", 
+                #"H63D:C282Y", # This needs to be done in recipe
+                "supersnip", "rs3094093", "rs114179634")
+f1 <- sprintf("hemochromatosis ~ %s", paste(variables1, collapse=" + "))
+f1
+```
+
+
+
+### Logistic regression model
+
+```{r}
+logistic_mod_1 <- parsnip::logistic_reg()
+logistic_mod_1
+```
+
+
+```{r}
+logistic_recipe_1 <- 
+  recipe(as.formula(f1), data = train) %>% 
+  #step_relevel(hemochromatosis, ref_level = "control") %>%
+  step_normalize(age) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_interact(terms = ~ H63D:C282Y)
+logistic_recipe_1
+```
+
+
+```{r}
+#logistic_fit_1 <- logistic_mod_1 %>%
+#  fit(as.formula(f1), data = model_train_data)
+logistic_wflow_1 <- 
+  workflow() %>% 
+  add_model(logistic_mod_1) %>% 
+  add_recipe(logistic_recipe_1)
+logistic_wflow_1
+```
+
+Actual model fitting.
+
+```{r}
+filename <- file.path(model_path, "logistic_ff_1.rds")
+if (! file.exists(filename) || recompute) {
+  logistic_fit_1 <- logistic_wflow_1 %>%
+    fit(data=train)
+  saveRDS(logistic_fit_1, filename)
+} else {
+  logistic_fit_1 <- readRDS(filename)
+}
+logistic_fit_1
+```
+
+
+
+
+```{r}
+#| layout-ncol: 2
+res <- performance_curves(logistic_fit_1, "Logistic regression 1 train", train)
+res[[1]] + res[[2]]
+```
+
+This will fit on training data and show performance measures on test data.
+
+```{r}
+filename <- file.path(model_path, "logistic_lf_1.rds")
+if (! file.exists(filename) || recompute) {
+  logistic_lf_1 <- last_fit(logistic_wflow_1, basic_split)  # Needs to be unfitted workflow
+  saveRDS(logistic_lf_1, filename)
+} else {
+  logistic_lf_1 <- readRDS(filename)
+}
+```
+
+
+```{r}
+class(logistic_lf_1)
+collect_metrics(logistic_lf_1)
+```
+
+Confidence intervals for the performance measures using percentile method.
+
+```{r, eval=FALSE}
+# Use 10 bootstrap samples
+logistic_perf_1 <- int_pctl(logistic_lf_1, times=10, metrics = yardstick::metric_set(accuracy, brier_class, roc_auc, pr_auc)) %>% 
+  mutate(model="Logistic regression 1")
+logistic_perf_1
+```
+
+```{r, eval=FALSE}
+lm_est <- function(split, ...) {
+  lm(f1, data = analysis(split)) %>%
+    tidy()
+}
+
+lm_est2 <- function(split, ...) {
+  logistic_wflow_1 %>%
+    fit(data=analysis(split)) %>%
+    tidy()
+}
+
+set.seed(52156)
+conf_boot <-
+  bootstraps(train, 10, apparent = TRUE) %>%
+  mutate(results = map(splits, lm_est))
+
+```
+
+Following does not work.
+
+```{r, eval=FALSE}
+collect_metrics(logistic_fit_1)
+```
+
+Basic info about the fit.
+
+```{r}
+broom::glance(logistic_fit_1)
+```
+
+
+
+```{r}
+logistic_lf_1 %>% extract_workflow() %>% glance()
+```
+
+
+Variance inflation factors. No inflation.
+
+```{r}
+logistic_fit_1 %>% extract_fit_engine() %>% car::vif() %>% sort(decreasing = TRUE)
+```
+
+The below crashes the notebook!!!
+
+```{r, eval=FALSE}
+logistic_fit_1 %>% extract_fit_engine() %>% plot()
+```
+
+R2 value:
+
+```{r}
+logistic_lf_1 %>% extract_workflow() %>% extract_fit_engine() %>% fmsb::NagelkerkeR2()
+```
+
+```{r}
+filename <- file.path(table_path, "logistic_cis_1.tsv")
+if (! file.exists(filename) || recompute) {
+  logistic_cis_1 <- compute_cis(logistic_fit_1)
+  write_tsv(logistic_cis_1, filename)
+} else {
+  logistic_cis_1 <- read_tsv(filename)
+}
+```
+
+
+
+```{r}
+#| fig-cap: The age is at first event for cases and at death or EOF for controls.
+filename <- file.path(figure_path, "logistic_cis_1.pdf")
+g <- plot_cis(logistic_cis_1, "Logistic model 1", subtitle=model_stats(logistic_lf_1))
+if (save_figs)
+  ggsave(filename, g)
+g
+```
+
+### Random forest model
+
+```{r}
+rf_mod_1 <- parsnip::rand_forest() %>%
+  set_engine("ranger", importance="impurity") %>%
+  set_mode("classification")
+rf_mod_1
+```
+
+
+```{r}
+rf_recipe_1 <- 
+  recipe(as.formula(f1), data = train) %>% 
+  step_normalize(age) %>%
+  step_dummy(all_nominal_predictors()) #%>%
+  #step_interact(terms = ~ H63D:C282Y)     # No interaction for random forest models
+rf_recipe_1
+```
+
+
+```{r}
+rf_wflow_1 <- 
+  workflow() %>% 
+  add_model(rf_mod_1) %>% 
+  add_recipe(rf_recipe_1)
+rf_wflow_1
+```
+
+
+```{r}
+filename <- file.path(model_path, "rf_ff_1.rds")
+if (! file.exists(filename) || recompute) {
+  rf_fit_1 <- rf_wflow_1 %>%
+    fit(data=train)
+  saveRDS(rf_fit_1, filename)
+} else {
+  rf_fit_1 <- readRDS(filename)
+}
+# Don't print the ranger object directly as its printout is large and will crash Rstudio!!!!!!!!!!!!
+rf_fit_1 %>% extract_fit_engine() %>% summary()
+```
+
+```{r}
+res <- performance_curves(rf_fit_1, "Random forest 1 train", train)
+res[[1]] + res[[2]]
+```
+
+
+
+This will fit on training data and show performance measures on test data.
+
+```{r}
+filename <- file.path(model_path, "rf_lf_1.rds")
+if (! file.exists(filename) || recompute) {
+  rf_lf_1 <- last_fit(rf_wflow_1, basic_split)  # Needs to be unfitted workflow
+  saveRDS(rf_lf_1, filename)
+} else {
+  rf_lf_1 <- readRDS(filename)
+}
+class(rf_lf_1)
+```
+
+
+```{r, eval=FALSE}
+collect_metrics(rf_lf_1)
+```
+
+Confidence intervals for the performance measures using percentile method.
+
+```{r, eval=FALSE}
+# Use 10 bootstrap samples
+rf_perf_1 <- int_pctl(rf_lf_1, times=10, metrics = yardstick::metric_set(accuracy, brier_class, roc_auc, pr_auc)) %>%
+  mutate(model="Random forest 1")
+rf_perf_1
+```
+
+Basic info about the fit. Not available for ranger object.
+
+```{r, eval=FALSE}
+broom::glance(rf_fit_1)
+```
+
+```{r}
+rf_lf_1 %>%
+  extract_workflow() %>%
+  extract_fit_parsnip() %>%
+  vip(geom="point") +
+  labs(title="Random forest 1")
+```
+
+### Lasso logistic regression
+
+```{r}
+# Create validation set
+val_set <- validation_split(train, 
+                            strata = hemochromatosis, 
+                            prop = 0.50)
+# Specify the model
+lasso_mod_1 <- 
+  logistic_reg(penalty = tune(), mixture = 1) %>%  # Mixture of 1 causes Lasso to be used
+  set_engine("glmnet")
+# Workflow
+lasso_wflow_1 <- workflow() %>%
+  add_recipe(logistic_recipe_1) %>%
+  add_model(lasso_mod_1)
+# Penalty grid
+lasso_grid <- tibble(penalty = 10^seq(-4, -1, length.out = 30))
+# Tune the penalty parameter
+lasso_tune_1 <- 
+  #lasso_mod_1 %>% 
+  lasso_wflow_1 %>% 
+  tune_grid(#preprocessor=as.formula(f1),
+            val_set,
+            grid = lasso_grid,
+            control = control_grid(save_pred = TRUE, save_workflow = TRUE),
+            metrics = metric_set(roc_auc))
+```
+
+```{r}
+lasso_tune_1 %>% collect_metrics()
+```
+
+```{r}
+lasso_tune_1 %>% compute_metrics(metric_set(pr_auc, roc_auc))
+```
+
+```{r}
+best_parameters <- lasso_tune_1 %>% select_best(metric = "roc_auc")
+best_penalty <- best_parameters %>% pull(penalty)
+```
+
+
+Lasso does not seem to help.
+
+```{r}
+res <- int_pctl(lasso_tune_1, 
+                metrics = metric_set(roc_auc, pr_auc), 
+                times=100,                   # For speed 
+                parameters=lasso_grid %>% head(n=5) # For speed
+                )
+res
+```
+
+
+
+```{r}
+#lasso_tune_1 %>% 
+res %>%
+  filter(.metric == "roc_auc") %>%
+  #collect_metrics() %>% 
+  ggplot(aes(x = penalty, y = .estimate)) + 
+  geom_ribbon(aes(ymin = .lower, ymax = .upper), fill="red") +
+  geom_point() + 
+  geom_line() + 
+  geom_vline(xintercept = best_penalty) +
+  ylab("Area under the ROC Curve") +
+  scale_x_log10(labels = scales::label_number())
+```
+
+
+```{r}
+res <- performance_curves(lasso_tune_1, "Lasso regression 1 train", new_data=train, parameters=best_parameters)
+res[[1]] + res[[2]]
+```
+
+```{r}
+filename <- file.path(model_path, "lasso_ff_1.rds")
+if (! file.exists(filename) || recompute) {
+  lasso_fit_1 <- lasso_tune_1 %>%
+    fit_best(parameters = best_parameters, verbose = TRUE, add_validation_set = TRUE)
+  saveRDS(lasso_fit_1, filename)
+} else {
+  lasso_fit_1 <- readRDS(filename)
+}
+lasso_fit_1
+```
+
+
+```{r}
+broom::glance(lasso_fit_1)
+```
+
+```{r}
+filename <- file.path(model_path, "lasso_lf_1.rds")
+if (! file.exists(filename) || recompute) {
+  lasso_lf_1 <- lasso_wflow_1 %>%
+    finalize_workflow(best_parameters) %>%
+    last_fit(basic_split)
+  saveRDS(lasso_lf_1, filename)
+} else {
+  lasso_lf_1 <- readRDS(filename)
+}
+#lasso_lf_1  # this will cause a large printout when knitting
+```
+
+```{r}
+lasso_lf_1 %>% extract_workflow() %>% broom::glance()
+```
+
+
+```{r, eval=FALSE}
+lasso_lf_1 %>% collect_metrics()
+```
+
+Confidence intervals for the performance measures using percentile method.
+
+```{r, eval=FALSE}
+# Use 10 bootstrap samples
+lasso_perf_1 <- int_pctl(lasso_lf_1, times=10, metrics = yardstick::metric_set(accuracy, brier_class, roc_auc, pr_auc)) %>% 
+  mutate(model="Lasso regression 1")
+lasso_perf_1
+```
+
+Effect sizes.
+
+```{r}
+filename <- file.path(table_path, "lasso_cis_1.tsv")
+if (! file.exists(filename) || recompute) {
+  #logistic_cis_1 <- compute_cis(logistic_fit_1)
+  lasso_cis_1 <- lasso_lf_1 %>% extract_workflow() %>% extract_fit_parsnip() %>% tidy()  # exponentiate = TRUE does not work
+  
+  lasso_cis_1 <- lasso_cis_1 %>% 
+    filter(term != "(Intercept)") %>%
+    mutate(
+      estimate = exp(estimate),
+      conf.low = estimate, conf.high = estimate)   # Fake confidence intervals for plot_cis function
+  write_tsv(lasso_cis_1, filename)
+} else {
+  lasso_cis_1 <- read_tsv(filename)
+}
+```
+
+
+```{r}
+filename <- file.path(figure_path, "lasso_cis_1.pdf")
+g <- plot_cis(lasso_cis_1, "Lasso model 1", lasso=TRUE)
+if (save_figs)
+  ggsave(filename, g)
+g
+# lasso_cis_1 %>% filter(term != "(Intercept)") %>% 
+#   ggplot(aes(estimate, term)) + 
+#   geom_vline(xintercept = 0, color="gray") +
+#   geom_point() +
+#   labs(title="Lasso 1")
+```
+
+
+### Combine results
+
+ranger object does not have a glance method.
+
+```{r}
+#broom::glance(logistic_fit_1)
+map(list(logistic=logistic_fit_1, lasso=lasso_fit_1), broom::glance) %>%
+  bind_rows(.id="method")
+```
+
+```{r, eval=FALSE}
+all_performances <- bind_rows(logistic_perf_1, rf_perf_1, lasso_perf_1)
+all_performances
+all_performances %>% ggplot(aes(xmin=.lower, xmax=.upper, x=.estimate, y=model)) +
+  geom_pointrange() + facet_wrap(~ .metric)#, scales = "free_x")
+```
+
+
+
+```{r, eval=FALSE}
+filename <- file.path(result_path, "logistic_lf_1.rds")
+logistic_lf_1 <- readRDS(filename)
+```
+
+```{r, eval=FALSE}
+filename <- file.path(result_path, "lasso_lf_1.rds")
+lasso_lf_1 <- readRDS(filename)
+```
+
+```{r, eval=FALSE}
+filename <- file.path(result_path, "rf_lf_1.rds")
+rf_lf_1 <- readRDS(filename)
+```
+
+
+
+#### ROC and PR curves
+
+
+
+```{r}
+preds <- #list(logistic=logistic_lf_1, lasso=lasso_lf_1, rf=rf_lf_1) %>% 
+  list(logistic=logistic_fit_1, lasso=lasso_fit_1, rf=rf_fit_1) %>% 
+  #map(collect_predictions) %>%
+  map(function(x) augment(x, new_data=train)) %>%
+  bind_rows(.id = "model") %>%
+  group_by(model)
+```
+
+
+```{r}
+preds %>%
+  roc_curve(hemochromatosis, .pred_case, event_level = "second") %>%
+  autoplot() +
+  labs(title="ROC model 1")
+```
+
+```{r}
+preds %>%
+  pr_curve(hemochromatosis, .pred_case, event_level = "second") %>%
+  autoplot() +
+  labs(title="PR model 1")
+```
+
+#### Effect sizes
+
+Random forest importance plot.
+
+```{r}
+
+rf_vip_1 <- rf_lf_1 %>%
+  extract_workflow() %>%
+  extract_fit_parsnip() %>%
+  vi()
+g2 <- rf_vip_1 %>%
+  add_row(Variable = "H63D_x_C282Y", Importance=NA) %>%
+  mutate(term = Variable, estimate = Importance,
+         term = fct_relevel(term, intersect(names(pretty_conv), term)),
+         term = fct_relabel(term, ~ coalesce(pretty_conv[.x], .x)),
+         term = fct_rev(term)) %>%
+  ggplot(aes(x=estimate, y=term)) +
+  geom_point() +
+  labs(title="Random forest 1", x="Importance", y="")
+g2
+```
+
+Logistic regression versus lasso.
+
+```{r}
+cis_1 <- bind_rows(logistic = logistic_cis_1, 
+                   lasso = lasso_cis_1, #) %>% 
+                   #filter(term != "(Intercept)")# %>%
+                   #mutate(estimate = exp(estimate)
+                   #       ), 
+                 .id = "model")
+g1 <- cis_1 %>% 
+  mutate(term = str_remove(term, "TRUE"),
+         term = fct_relevel(term, intersect(names(pretty_conv), term)),
+         #term = fct_recode(!!pretty_conv), 
+         term = fct_relabel(term, ~ coalesce(pretty_conv[.x], .x)),
+         term = fct_rev(term),
+         hollow_color = if_else((model == "lasso" & estimate == 1) | 
+                                  (model == "logistic" & conf.low < 1 & conf.high > 1), 
+                                NA, 
+                                model)) %>%
+  ggplot(aes(x=estimate, xmin=conf.low, xmax=conf.high, y=term, color=model, fill=hollow_color)) + 
+  geom_vline(xintercept = 1, color="gray") +
+  geom_linerange(position = position_dodge(width = 0.5)) + 
+  geom_point(shape=21, size=3, position = position_dodge(width = 0.5)) +
+  scale_fill_discrete(na.value=NA, guide="none") +  
+  scale_x_log10() +
+  labs(title="Model 1", x="Odds ratio", y="Variable") +
+  theme(legend.position = "bottom")
+```
+
+```{r}
+#g <- g1 + g2
+g <- g1
+g
+filename <- file.path(figure_path, "cis_1.pdf")
+if (save_figs)
+  ggsave(filename, g)
+```
+
+
+### Confusion matrix
+
+```{r}
+confusion_matrix <- function(model, newdata=NULL) { # Unfinished
+  pred <- augment(model, type.predict = "response", newdata=newdata)
+  pred
+}
+# compute_helper <- function(model, newdata=NULL, boot.n=2000) {
+#   pred <- augment(model, type.predict = "link", newdata=newdata)
+#   g <- pred %>% ggplot(aes(.fitted)) + geom_histogram()
+#   distribution_df = pred %>% select(hemochromatosis, .fitted) %>% summary()
+#   res <- create_precision_recall_new(pred$hemochromatosis, pred$.fitted, boot.n=boot.n)
+#   res$pr_plot
+#   list(distribution=g, distribution_df=distribution_df, pr_plot=res$pr_plot, pr_ci=res$pr_ci)
+# }
+```
+
+
+
+
+
+
+## Model 2
+
+With HC credible snips and some diseases.
+
+### Logistic regression
+
+```{r}
+variables2 <- c("blood_donor", "sex2", "age", disease_names, credible_snip_names, known_snip_names, hla_snip_names)
+f2 <- sprintf("hemochromatosis ~ %s", 
+             paste(variables2, collapse=" + ")
+             )
+f2
+```
+
+```{r}
+logistic_mod_2 <- parsnip::logistic_reg()
+logistic_mod_2
+```
+
+
+```{r}
+logistic_recipe_2 <- 
+  recipe(as.formula(f2), data = train) %>% 
+  #step_relevel(hemochromatosis, ref_level = "control") %>%
+  step_normalize(age) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_interact(terms = ~ C282Y:H63D)
+#  step_interact(terms = ~ H63D:C282Y + H1_2:C282Y + S65C:C282Y + supersnips:C282Y)
+logistic_recipe_2
+```
+
+```{r}
+logistic_wflow_2 <- 
+  workflow() %>% 
+  add_model(logistic_mod_2) %>% 
+  add_recipe(logistic_recipe_2)
+logistic_wflow_2
+```
+
+This will fit on training data and show performance measures on test data.
+
+```{r}
+filename <- file.path(model_path, "logistic_lf_2.rds")
+if (! file.exists(filename) || recompute) {
+  logistic_lf_2 <- last_fit(logistic_wflow_2, basic_split)  # Needs to be unfitted workflow
+  saveRDS(logistic_lf_2, filename)
+} else {
+  logistic_lf_2 <- readRDS(filename)
+}
+```
+
+```{r}
+logistic_lf_2 %>% extract_workflow() #%>% extract_fit_parsnip()
+```
+
+
+```{r, eval=FALSE}
+class(logistic_lf_2)
+collect_metrics(logistic_lf_2)
+```
+
+
+
+
+```{r}
+logistic_lf_2 %>% extract_workflow() %>% glance()
+```
+
+Variance inflation factors.
+
+```{r}
+logistic_lf_2 %>% extract_workflow() %>% extract_fit_engine() %>% car::vif() %>% sort(decreasing = TRUE)
+```
+
+All VIFs are below 5, except two hla snips. These two snips are just the ones that have the reference allele as minor allele.
+
+Let's check the correlations.
+
+```{r}
+train %>% 
+  select(all_of(hla_snip_names), all_of(credible_snip_names), all_of(known_snip_names)) %>% 
+  my_correlation() %>% 
+  plot_correlation() + 
+  theme(axis.text.x = element_text(angle = 45, vjust=1, hjust=1))
+```
+
+Lot's of LD in the HLA area, as expected.
+
+```{r, eval=FALSE}
+logistic_lf_2 %>% extract_workflow() %>% extract_fit_engine() %>% plot()
+```
+
+R2 value:
+
+```{r}
+logistic_lf_2 %>% extract_workflow() %>% extract_fit_engine() %>% fmsb::NagelkerkeR2()
+```
+
+```{r}
+filename <- file.path(table_path, "logistic_cis_2.tsv")
+if (! file.exists(filename) || recompute) {
+  logistic_cis_2 <- compute_cis(logistic_lf_2 %>% extract_workflow())
+  write_tsv(logistic_cis_2, filename)
+} else {
+  logistic_cis_2 <- read_tsv(filename)
+}
+```
+
+```{r}
+filename <- file.path(figure_path, "logistic_cis_2.pdf")
+g <- plot_cis(logistic_cis_2, "Logistic model 2")
+if (save_figs)
+  ggsave(filename, g)
+g
+```
+
+
+
+## Old Lasso model
+
+```{r, eval=FALSE}
+f <- as.formula("hemochromatosis ~ blood_donor + sex + age")
+x <- model.matrix(f, data = train)[,-1]
+y <- train$hemochromatosis
+# Use cross validation to find optimal lambda hyperparameter of lasso over a grid of candidate values
+grid <- 10^seq(10, -2, length = 100)
+train_indices <- sample(1:nrow(x), nrow(x) / 2)
+lasso_mod <- cv.glmnet(x[train_indices, ], y[train_indices], family="binomial", alpha = 1, lambda = grid)
+plot(lasso_mod)
+best_lambda <- lasso_mod$lambda.min
+cat(glue("Best lambda is {best_lambda}"))
+```
+
+
+## Model 3
+
+```{r}
+variables3 <- c("sex2", "age", "donations_in_five_years", 
+                #"H1_2", # is correlated with C282Y
+                "H63D", "S65C", "C282Y", 
+                credible_snip_names,
+                "supersnip", "rs3094093", "rs114179634", "rs9261354")
+f3 <- sprintf("hemochromatosis ~ %s", paste(variables3, collapse=" + "))
+f3
+```
+
+```{r logistic-mod-3}
+logistic_mod_3 <- parsnip::logistic_reg()
+logistic_mod_3
+```
+
+
+```{r logistic_recipe-3}
+logistic_recipe_3 <- 
+  recipe(as.formula(f3), data = train) %>% 
+  #step_relevel(hemochromatosis, ref_level = "control") %>%
+  step_normalize(age) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_interact(terms = ~ C282Y : c(H63D, S65C, supersnip, donations_in_five_years, sex2_pre, sex2_post)) %>%
+  step_lincomb(all_numeric_predictors()) # Removes variables that have exact linear combinations with others
+#  step_interact(terms = ~ H63D:C282Y + H1_2:C282Y + S65C:C282Y + supersnips:C282Y)
+logistic_recipe_3
+```
+
+
+```{r logistic-workflow-3}
+logistic_wflow_3 <- 
+  workflow() %>% 
+  add_model(logistic_mod_3) %>% 
+  add_recipe(logistic_recipe_3)
+logistic_wflow_3
+```
+
+This will fit on training data and show performance measures on test data.
+
+```{r last-fit-3}
+filename <- file.path(model_path, "logistic_lf_3.rds")
+if (! file.exists(filename) || recompute) {
+  logistic_lf_3 <- last_fit(logistic_wflow_3, basic_split)  # Needs to be unfitted workflow
+  saveRDS(logistic_lf_3, filename)
+} else {
+  logistic_lf_3 <- readRDS(filename)
+}
+class(logistic_lf_3)
+```
+
+
+```{r, eval=FALSE}
+collect_metrics(logistic_lf_3)
+```
+
+Confidence intervals for the performance measures using percentile method.
+
+```{r logistic-perf-3, eval=FALSE}
+# Use 10 bootstrap samples
+logistic_perf_3 <- int_pctl(logistic_lf_3, times=10, 
+                            metrics = yardstick::metric_set(accuracy, brier_class, roc_auc, pr_auc)) %>% 
+  mutate(model="Logistic regression 3")
+logistic_perf_3
+```
+
+The below way of computing R2 does not work
+```{r logistic-perf-3b, eval=FALSE}
+# Use 10 bootstrap samples
+logistic_perf_3b <- int_pctl(logistic_lf_3, times=10, 
+                            metrics = yardstick::metric_set(rsq_trad)) %>%  # Neither does rsq work
+  mutate(model="Logistic regression 3")
+logistic_perf_3b
+```
+
+Show trained recipe.
+
+```{r}
+logistic_lf_3 %>% extract_workflow() %>% extract_recipe()
+```
+
+The step_lincomb removed zero variables.
+
+Basic info about the results. Turn off pretty printing otherwise knitting will hang.
+
+```{r basic_3, paged.print=FALSE}
+#logistic_lf_3
+```
+
+Basic info about the fit.
+
+```{r}
+logistic_lf_3 %>% extract_workflow() %>% glance()
+```
+
+
+Variance inflation factors.
+
+```{r logistic-vif-3}
+logistic_lf_3 %>% extract_workflow() %>% extract_fit_engine() %>% car::vif() %>% sort(decreasing = TRUE)
+```
+
+C282Y and its interaction with H1_2 has very high VIF values!!!
+
+R2 value:
+
+```{r}
+logistic_lf_3 %>% extract_workflow() %>% extract_fit_engine() %>% fmsb::NagelkerkeR2()
+```
+
+```{r logistic-cis-3}
+filename <- file.path(table_path, "logistic_cis_3.tsv")
+if (! file.exists(filename) || recompute) {
+  logistic_cis_3 <- compute_cis(logistic_lf_3 %>% extract_workflow())
+  write_tsv(logistic_cis_3, filename)
+} else {
+  logistic_cis_3 <- read_tsv(filename)
+}
+```
+
+```{r logistic-cis-plot-3}
+#| fig-cap: The age is at first event for cases and at death or EOF for controls.
+filename <- file.path(figure_path, "logistic_cis_3.pdf")
+g <- plot_cis(logistic_cis_3, "Logistic model 3")
+if (save_figs)
+  ggsave(filename, g)
+g
+```
+
+
+## Model 4
+
+This is like model 3 but recessive model for snips C282Y and H1-2 is used.
+
+```{r}
+variables4 <- c("sex2", "age", "donations_in_five_years", 
+                #"H1_2", # is correlated with C282Y
+                "H63D", "S65C", "C282Y", 
+                "supersnip",
+                credible_snip_names,
+                "rs3094093", "rs114179634", "rs9261354")
+f4 <- sprintf("hemochromatosis ~ %s", paste(variables4, collapse=" + "))
+f4
+```
+
+```{r logistic-mod-4}
+logistic_mod_4 <- parsnip::logistic_reg()
+logistic_mod_4
+```
+
+
+```{r logistic_recipe-4}
+logistic_recipe_4 <- 
+  recipe(as.formula(f4), data = train) %>% 
+  #step_relevel(hemochromatosis, ref_level = "control") %>%
+  step_normalize(age) %>%
+  step_mutate(C282Y = as.integer(C282Y == 2)) %>%     # Encode C282Y and H1-2 as recessive snips
+              #H1_2  = as.integer(H1_2 == 2)) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_interact(terms = ~ C282Y : c(H63D, S65C, supersnip, donations_in_five_years, sex2_pre, sex2_post)) %>%
+  step_lincomb(all_numeric_predictors()) # Removes variables that have exact linear combinations with others
+#  step_interact(terms = ~ H63D:C282Y + H1_2:C282Y + S65C:C282Y + supersnips:C282Y)
+logistic_recipe_4
+```
+
+
+```{r logistic-workflow-4}
+logistic_wflow_4 <- 
+  workflow() %>% 
+  add_model(logistic_mod_4) %>% 
+  add_recipe(logistic_recipe_4)
+logistic_wflow_4
+```
+
+This will fit on training data and show performance measures on test data.
+
+```{r last-fit-4}
+filename <- file.path(model_path, "logistic_lf_4.rds")
+if (! file.exists(filename) || recompute) {
+  logistic_lf_4 <- last_fit(logistic_wflow_4, basic_split)  # Needs to be unfitted workflow
+  saveRDS(logistic_lf_4, filename)
+} else {
+  logistic_lf_4 <- readRDS(filename)
+}
+class(logistic_lf_4)
+```
+
+
+```{r, eval=FALSE}
+collect_metrics(logistic_lf_4)
+```
+
+Confidence intervals for the performance measures using percentile method.
+
+```{r logistic-perf-4, eval=FALSE}
+# Use 10 bootstrap samples
+logistic_perf_4 <- int_pctl(logistic_lf_4, times=10, 
+                            metrics = yardstick::metric_set(accuracy, brier_class, roc_auc, pr_auc)) %>% 
+  mutate(model="Logistic regression 4")
+logistic_perf_4
+```
+
+
+Show trained recipe.
+
+```{r}
+logistic_lf_4 %>% extract_workflow() %>% extract_recipe()
+```
+
+The step_lincomb removed two interactions!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+
+Basic info about the fit.
+
+```{r}
+logistic_lf_4 %>% extract_workflow() %>% glance()
+```
+
+
+Variance inflation factors.
+
+```{r logistic-vif-4}
+logistic_lf_4 %>% extract_workflow() %>% extract_fit_engine() %>% car::vif() %>% sort(decreasing = TRUE)
+```
+
+C282Y and its interaction with H1_2 has very high VIF values!!!
+
+R2 value.
+
+```{r}
+logistic_lf_4 %>% extract_workflow() %>% extract_fit_engine() %>% fmsb::NagelkerkeR2()
+```
+
+```{r logistic-cis-4}
+filename <- file.path(table_path, "logistic_cis_4.tsv")
+if (! file.exists(filename) || recompute) {
+  logistic_cis_4 <- compute_cis(logistic_lf_4 %>% extract_workflow())
+  write_tsv(logistic_cis_4, filename)
+} else {
+  logistic_cis_4 <- read_tsv(filename)
+}
+```
+
+```{r logistic-cis-plot-4}
+#| fig-cap: The age is at first event for cases and at death or EOF for controls.
+filename <- file.path(figure_path, "logistic_cis_4.pdf")
+g <- plot_cis(logistic_cis_4, "Logistic model 4")
+if (save_figs)
+  ggsave(filename, g)
+g
+```
+
+
+
+
+## Model 5
+
+Best FinnGen logistic model
+
+### Basic logistic model
+
+This is like model 3 but full model for snips C282Y, H63D and ~H1-2~ is used.
+
+```{r}
+variables5 <- c("sex2", "age", "donations_in_five_years", 
+                #"H1_2", # is correlated with C282Y
+                "H63D", "S65C", "C282Y", 
+                "supersnip",
+                credible_snip_names,
+                disease_names,
+                "rs3094093", "rs114179634"#, "rs9261354"  # HLA snips
+                )
+f5 <- sprintf("hemochromatosis ~ %s", paste(variables5, collapse=" + "))
+f5
+```
+
+```{r logistic-mod-5}
+logistic_mod_5 <- parsnip::logistic_reg()
+logistic_mod_5
+```
+
+
+```{r logistic_recipe-5}
+logistic_recipe_5_pre <- 
+  recipe(as.formula(f5), data = train) %>%   # The data is needed here only for the names and types of columns
+  #step_relevel(hemochromatosis, ref_level = "control") %>%
+  step_normalize(age) %>%
+  # step_mutate(C282Y = as.integer(C282Y == 2),     # Encode C282Y and H1-2 as recessive snips
+  #             H1_2  = as.integer(H1_2 == 2)) %>%
+  step_mutate(C282Y = as.factor(C282Y),     # Encode C282Y, H63D and H1-2 as factors
+              H63D  = as.factor(H63D))
+              #H1_2  = as.factor(H1_2)) %>%
+logistic_recipe_5 <- logistic_recipe_5_pre %>%
+  step_dummy(all_nominal_predictors(), C282Y, H63D) %>%
+  step_interact(terms = ~ starts_with("C282Y") : c(starts_with("H63D"), S65C, supersnip, donations_in_five_years, sex2_pre, sex2_post
+                                                   #rs3094093, rs114179634,
+                                                   )) %>%
+  step_lincomb(all_numeric_predictors()) # Removes variables that have exact linear combinations with others
+#  step_interact(terms = ~ H63D:C282Y + H1_2:C282Y + S65C:C282Y + supersnips:C282Y)
+logistic_recipe_5
+```
+
+
+```{r logistic-workflow-5}
+logistic_wflow_5 <- 
+  workflow() %>% 
+  add_model(logistic_mod_5) %>% 
+  add_recipe(logistic_recipe_5)
+logistic_wflow_5
+```
+
+This will fit on training data and show performance measures on test data.
+
+```{r last-fit-5}
+filename <- file.path(model_path, "logistic_lf_5.rds")
+if (! file.exists(filename) || recompute) {
+  logistic_lf_5 <- last_fit(logistic_wflow_5, basic_split)  # Needs to be unfitted workflow
+  saveRDS(logistic_lf_5, filename)
+} else {
+  logistic_lf_5 <- readRDS(filename)
+}
+class(logistic_lf_5)
+```
+
+```{r full-fit-5}
+filename <- file.path(model_path, "logistic_full_5.rds")
+if (! file.exists(filename) || recompute) {
+  logistic_full_5 <- fit(logistic_wflow_5, basic)  # Needs to be unfitted workflow
+  saveRDS(logistic_full_5, filename)
+} else {
+  logistic_full_5 <- readRDS(filename)
+}
+```
+
+```{r}
+logistic_lf_5 %>% extract_fit_engine() %>% exact_zeros_or_ones()
+logistic_full_5 %>% extract_fit_engine() %>% exact_zeros_or_ones()
+```
+
+```{r, eval=FALSE}
+collect_metrics(logistic_lf_5)
+```
+
+Confidence intervals for the performance measures using percentile method.
+
+```{r logistic-perf-5, eval=FALSE}
+# Use 10 bootstrap samples
+logistic_perf_5 <- int_pctl(logistic_lf_5, times=10, 
+                            metrics = yardstick::metric_set(accuracy, brier_class, roc_auc, pr_auc)) %>% 
+  mutate(model="Logistic regression 5")
+logistic_perf_5
+```
+
+
+Show trained recipe.
+
+```{r}
+logistic_lf_5 %>% extract_workflow() %>% extract_recipe()
+```
+
+The step_lincomb removed two interactions!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+
+Basic info about the fit.
+
+```{r glance5}
+logistic_lf_5 %>% extract_workflow() %>% glance()
+```
+
+```{r}
+logistic_lf_5 %>% extract_workflow() %>% extract_fit_engine() %>% fmsb::NagelkerkeR2()
+```
+
+Variance inflation factors.
+
+```{r logistic-vif-5}
+logistic_lf_5 %>% extract_workflow() %>% extract_fit_engine() %>% car::vif() %>% sort(decreasing = TRUE)
+```
+
+C282Y and its interaction with H1_2 has very high VIF values!!!
+
+Calibration.
+
+```{r}
+logistic_lf_5_test_pred <- augment(logistic_lf_5)
+logistic_lf_5_test_pred %>%
+  cal_plot_windowed(truth = hemochromatosis, estimate = .pred_case, step_size = 0.025, event_level="second")
+```
+
+##### Forest plots
+
+```{r logistic-cis-5}
+filename <- file.path(table_path, "logistic_cis_5.tsv")
+if (! file.exists(filename) || recompute) {
+  logistic_cis_5 <- compute_cis(logistic_lf_5 %>% extract_workflow())
+  write_tsv(logistic_cis_5, filename)
+} else {
+  logistic_cis_5 <- read_tsv(filename)
+}
+```
+
+
+
+```{r logistic-cis-plot-5}
+#| fig-cap: The age is at first event for cases and at death or EOF for controls.
+filename <- file.path(figure_path, "logistic_cis_5.pdf")
+g <- plot_cis(logistic_cis_5, "Logistic model 5 FinnGen", subtitle=model_stats(logistic_lf_5)) + labs(y="Variable")
+##ggsave(file.path(figure_path, "poster", "logistic_cis_5.pdf"), g + theme(plot.title=element_blank(), axis.title.y.left = element_blank()))
+if (save_figs)
+  ggsave(filename, g, width=7, height=7)
+g
+```
+
+```{r logistic-cis-full-5}
+filename <- file.path(table_path, "logistic_cis_full_5.tsv")
+if (! file.exists(filename) || recompute) {
+  logistic_cis_full_5 <- compute_cis(logistic_full_5)
+  write_tsv(logistic_cis_full_5, filename)
+} else {
+  logistic_cis_full_5 <- read_tsv(filename)
+}
+```
+
+```{r logistic-cis-full-plot-5}
+#| fig-cap: The age is at first event for cases and at death or EOF for controls.
+filename <- file.path(figure_path, "logistic_cis_full_5.pdf")
+g <- plot_cis(logistic_cis_full_5, "Logistic model 5 full FinnGen", subtitle=model_stats(logistic_full_5)) + labs(y="Variable")
+#ggsave(file.path(figure_path, "poster", "logistic_cis_5.pdf"), g + theme(plot.title=element_blank(), axis.title.y.left = element_blank()))
+if (save_figs)
+  ggsave(filename, g, width=7, height=7)
+g
+```
+
+The following computes the effect sizes of combinations of predictors with confidence intervals.
+
+```{r}
+fit <- logistic_full_5 %>% extract_fit_engine()
+
+# The columns C282Y and H63D are not really needed in the below tibble
+df <-  tribble(
+    ~C282Y, ~H63D, ~`variables`,
+    0, 0, c(),
+    0, 1, c("H63D_X1"),
+    0, 2, c("H63D_X2"),
+    1, 0, c("C282Y_X1"),
+    1, 1, c("C282Y_X1", "H63D_X1", "C282Y_X1_x_H63D_X1"),
+    1, 2, c("C282Y_X1", "H63D_X2", "C282Y_X1_x_H63D_X2"),
+    2, 0, c("C282Y_X2"),
+    2, 1, c("C282Y_X2", "H63D_X1", "C282Y_X2_x_H63D_X1"),
+    2, 2, c("C282Y_X2", "H63D_X2", "C282Y_X2_x_H63D_X2"),
+  )
+  #summarise(C282Y, H63D, get_odds_ratios(fit, variables, exponentiate = TRUE))
+cis <- get_odds_ratio_sums(fit, df, exponentiate=TRUE)
+cis %>% 
+  mutate(name = glue("C282Y={C282Y} H63D={H63D}"),
+         name = fct_rev(name)) %>%
+  ggplot(aes(x=estimate, y = name, xmin = conf.low, xmax = conf.high)) +
+  geom_vline(xintercept = 1, color="gray") +
+  geom_point() +
+  geom_linerange() +
+  scale_x_log10() +
+  labs(x="Odds ratio", y="Dosage combination")
+```
+
+
+#### Risk table
+
+Create synthetic data.
+
+```{r}
+# The value of age is stratified by sex
+mean_ages5 <- train %>% group_by(sex2) %>% summarise(age = mean(age))
+data5 <- expand_grid(sex2 = c("male", "pre", "post"), donations_in_five_years=seq(0, 10, 5),  
+                    credible1=0:2, credible2=0, credible3=0,
+                    I9_HYPTENSESS=FALSE, M13_ARTHROSIS=FALSE, K11_CHOLELITH=FALSE, E4_HYTHYNAS=FALSE, C3_CANCER=FALSE,
+                    H63D=0:2, S65C=0, C282Y=0:2, supersnip=0:2, 
+                    rs3094093=2, rs114179634=0) %>% 
+  mutate(across(sex2, as.factor))
+# data5 <- data5 %>% mutate(age=mean(train$age))     # This was a bad idea
+data5 <- data5 %>% inner_join(mean_ages5, by="sex2")
+important_predictors5 <- c(Donations="donations_in_five_years", Sex2="sex2", "H63D", "C282Y", HLA3="supersnip", Causal1="credible1") %>% fill_names()
+
+cat("The following variables were fixed during the computation of probabilities\n")
+fixed_predictors5 <- get_fixed_predictors(data5, important_predictors5)
+fixed_predictors5
+```
+
+
+New version
+
+
+New version, train data.
+
+```{r, fig.width=12, fig.height=12}
+title <- "Model 5 train data"
+filename <- file.path(table_path, "risk_table_5_train.tsv")
+if (! file.exists(filename) | recompute) {
+  result  <- compute_risk_table(logistic_lf_5, data5, important_predictors5, count_data = train, col="sex2", conf.level = 0.95)
+  result2 <- compute_risk_table(logistic_lf_5, data5, important_predictors5, count_data = train, col="sex2", conf.level = 0.80)
+  result <- bind_rows(result, result2)
+  write_tsv(result, filename)
+} else {
+  result <- read_tsv(filename)
+}
+p <- plot_risk_table(result, important_predictors5, title=title, col = "sex2", conf.level = c(0.95, 0.80))
+if (save_figs) {
+  filename <- file.path(figure_path, "risk_table_5_train.pdf")
+  pdf(filename, width=12, height=12, title=title)
+  plot(p[[1]], new_page=TRUE)
+  plot(p[[2]], new_page=FALSE)
+  invisible(dev.off())
+}
+dev.new()
+plot(p[[1]], new_page=TRUE)
+plot(p[[2]], new_page=FALSE)
+```
+
+New version, test data.
+
+```{r, fig.width=12, fig.height=12}
+title <- "Model 5 test data"
+filename <- file.path(table_path, "risk_table_5_test.tsv")
+if (! file.exists(filename) | recompute) {
+  result  <- compute_risk_table(logistic_lf_5, data5, important_predictors5, count_data = test, col="sex2", conf.level = 0.95)
+  result2 <- compute_risk_table(logistic_lf_5, data5, important_predictors5, count_data = test, col="sex2", conf.level = 0.80)
+  result <- bind_rows(result, result2)
+  write_tsv(result, filename)
+} else {
+  result <- read_tsv(filename)
+}
+p <- plot_risk_table(result, important_predictors5, title=title, col = "sex2", conf.level = c(0.95, 0.80))
+if (save_figs) {
+  filename <- file.path(figure_path, "risk_table_5_test.pdf")
+  pdf(filename, width=12, height=12, title=title)
+  plot(p[[1]], new_page=TRUE)
+  plot(p[[2]], new_page=FALSE)
+  invisible(dev.off())
+}
+dev.new()
+plot(p[[1]], new_page=TRUE)
+plot(p[[2]], new_page=FALSE)
+
+```
+
+full data.
+
+```{r, fig.width=12, fig.height=12}
+title <- "Model 5 full data"
+filename <- file.path(table_path, "risk_table_5_full.tsv")
+if (! file.exists(filename) | recompute) {
+  result  <- compute_risk_table(logistic_full_5, data5, important_predictors5, count_data = basic, col="sex2", conf.level = 0.95)
+  result2 <- compute_risk_table(logistic_full_5, data5, important_predictors5, count_data = basic, col="sex2", conf.level = 0.80)
+  result <- bind_rows(result, result2)
+  write_tsv(result, filename)
+} else {
+  result <- read_tsv(filename)
+}
+p <- plot_risk_table(result, important_predictors5, title=title, col = "sex2", conf.level = c(0.95, 0.80),
+                     number_of_blocks = 6)
+if (save_figs) {
+  filename <- file.path(figure_path, "risk_table_5_full.pdf")
+  pdf(filename, width=12, height=12, title=title)
+  plot(p[[1]], new_page=TRUE)
+  plot(p[[2]], new_page=FALSE)
+  invisible(dev.off())
+}
+dev.new()
+plot(p[[1]], new_page=TRUE)
+plot(p[[2]], new_page=FALSE)
+
+```
+
+Try with maximum allowed donations.
+
+18-25-vuotiaille naisille suosittelemme luovuttamista korkeintaan kerran vuodessa ja muille naisille enintään 2-3 kertaa vuodessa.
+
+Miehille suosittelemme enintään 3-4 verenluovutusta vuodessa.
+
+Sallitut minimivälit kokoverenluovutuksille ovat naisille 91 ja miehille 61 vuorokautta. 
+
+```{r}
+# The value of age is stratified by sex
+mean_ages5 <- train %>% group_by(sex2) %>% summarise(age = mean(age))
+mean_ages5
+```
+
+
+```{r}
+maximum_donations <- tibble(sex2 = fct_inorder(c("male", "pre", "post")),
+                            donations_in_five_years = c(5 * 4, 5 * 3, 5 * 3))
+maximum_donations
+```
+
+
+```{r}
+data5b <- expand_grid(sex2 = c("male", "pre", "post"),
+                    credible1=0:2, credible2=0, credible3=0,
+                    I9_HYPTENSESS=FALSE, M13_ARTHROSIS=FALSE, K11_CHOLELITH=FALSE, E4_HYTHYNAS=FALSE, C3_CANCER=FALSE,
+                    H63D=0, S65C=0, C282Y=2, supersnip=0:2, 
+                    rs3094093=2, rs114179634=0) %>% 
+  mutate(across(sex2, as.factor))
+data5b <- data5b %>% 
+  inner_join(mean_ages5, by="sex2") %>%
+  inner_join(maximum_donations, by="sex2")
+important_predictors5b <- c(Donations="donations_in_five_years", Sex2="sex2", "H63D", "C282Y", HLA3="supersnip", Causal1="credible1") %>% fill_names()
+
+cat("The following variables were fixed during the computation of probabilities\n")
+fixed_predictors5b <- get_fixed_predictors(data5, important_predictors5)
+fixed_predictors5b
+```
+
+```{r}
+cis <- compute_risk_cis(logistic_full_5, data5b, important_predictors5b, count_data = basic, conf.level = 0.95)
+cis %>% group_by(sex2) %>% filter(n >= 5, credible1 == 0, supersnip == 1) %>% slice_max(n=3, order_by=mean) %>%
+  mutate(across(c(mean, lower, upper), ~ sprintf("%.3f", .)))
+```
+
+Combined effect.
+
+```{r}
+C282Y_plus_HLA3(logistic_cis_full_5)
+```
+
+### EOF age model
+
+Replace event age by EOF age. This is not needed anymore since all logistic models using EOF age by default
+
+```{r, eval=FALSE}
+basic2 <- basic %>% 
+  select(-(int1:int67)) %>%
+  left_join(EOF_AGE, by="sample") %>%
+  mutate(age = AGE_AT_DEATH_OR_END_OF_FOLLOWUP,
+         sex2 = create_sex2(sex, age))   # We need to recreate this
+```
+
+
+
+```{r, eval=FALSE}
+filename <- file.path(model_path, "logistic_eof_age_full_5.rds")
+if (! file.exists(filename) || recompute) {
+  logistic_eof_age_full_5 <- fit(logistic_wflow_5, basic2)  # Needs to be unfitted workflow
+  saveRDS(logistic_eof_age_full_5, filename)
+} else {
+  logistic_eof_age_full_5 <- readRDS(filename)
+}
+```
+
+```{r, eval=FALSE}
+filename <- file.path(table_path, "logistic_cis_eof_age_full_5.tsv")
+if (! file.exists(filename) || recompute) {
+  logistic_cis_eof_age_full_5 <- compute_cis(logistic_eof_age_full_5)
+  write_tsv(logistic_cis_eof_age_full_5, filename)
+} else {
+  logistic_cis_eof_age_full_5 <- read_tsv(filename)
+}
+```
+
+```{r, eval=FALSE}
+age_comparison <- bind_rows(event_age = logistic_cis_full_5, eof_age = logistic_cis_eof_age_full_5, .id="model")
+```
+
+```{r, eval=FALSE}
+#| fig-cap: The event age is at first event for cases and at death or EOF for controls in the event age model. The event age is the age at the end of followup in the eof_age model.
+filename <- file.path(figure_path, "logistic_cis_eof_age_full_5.pdf")
+g <- plot_cis2(age_comparison, "Logistic model eof age 5 full FinnGen") + labs(y="Variable")
+g <- g + guides(color = guide_legend(reverse = TRUE, override.aes = list(shape = 16)))
+if (save_figs)
+  ggsave(filename, g, width=7, height=7)
+g
+```
+
+### Alternative hemochromatosis definition
+
+```{r}
+filename <- file.path(result_path, "venesections.tsv.gz")
+venesections <- read_tsv(filename)
+venesections <- venesections %>%
+  mutate(across(where(is.character), as.factor))
+venesections %>% select(-FINNGENID) %>% summary()
+```
+
+```{r}
+venesection_count <- venesections %>%
+  count(FINNGENID, name = "count")
+```
+
+Form new endpoint.
+
+```{r}
+basic3 <- basic %>%
+  select(-(int1:int67)) %>%
+  left_join(venesection_count, by=c(sample="FINNGENID")) %>%
+  replace_na(list(count=0)) %>%
+  mutate(new_hemochromatosis = case_when(hemochromatosis == "case" & count > 0  ~ "case",
+                                         hemochromatosis == "case" & count == 0 ~ NA,
+                                         TRUE                                   ~ "control"
+                                       ) %>% 
+           factor(levels = c("control", "case")))
+basic3 %>% select(hemochromatosis, new_hemochromatosis) %>% table(useNA = "always")  
+basic2 <- basic3 %>% mutate(hemochromatosis=new_hemochromatosis) %>% filter(!is.na(hemochromatosis))
+rm(basic3)
+```
+
+Drops S65C and its interactions.
+
+```{r}
+alternative_variables5 <- c("sex2", "age", "donations_in_five_years", 
+                #"H1_2", # is correlated with C282Y
+                "H63D", "S65C", 
+                "C282Y", 
+                "supersnip",
+                credible_snip_names,
+                disease_names,
+                "rs3094093", "rs114179634"#, "rs9261354"  # HLA snips
+                )
+alternative_f5 <- sprintf("hemochromatosis ~ %s", paste(alternative_variables5, collapse=" + "))
+alternative_f5
+```
+
+```{r}
+logistic_alternative_mod_5 <- parsnip::logistic_reg()
+logistic_alternative_mod_5
+```
+
+
+```{r}
+logistic_alternative_recipe_5 <- 
+  recipe(as.formula(alternative_f5), data = train) %>%   # The data is needed here only for the names and types of columns
+  #step_relevel(hemochromatosis, ref_level = "control") %>%
+  step_normalize(age) %>%
+  # step_mutate(C282Y = as.integer(C282Y == 2),     # Encode C282Y and H1-2 as recessive snips
+  #             H1_2  = as.integer(H1_2 == 2)) %>%
+  step_mutate(C282Y = as.factor(C282Y),     # Encode C282Y, H63D and H1-2 as factors
+              H63D  = as.factor(H63D)) %>%
+              #H1_2  = as.factor(H1_2)) %>%
+  step_dummy(all_nominal_predictors(), C282Y, H63D) %>%
+  step_interact(terms = ~ starts_with("C282Y") : c(starts_with("H63D"), S65C, supersnip, donations_in_five_years, sex2_pre, sex2_post
+                                                   #rs3094093, rs114179634,
+                                                   )) %>%
+  step_lincomb(all_numeric_predictors()) # Removes variables that have exact linear combinations with others
+#  step_interact(terms = ~ H63D:C282Y + H1_2:C282Y + S65C:C282Y + supersnips:C282Y)
+logistic_alternative_recipe_5
+```
+
+
+```{r}
+logistic_alternative_wflow_5 <- 
+  workflow() %>% 
+  add_model(logistic_alternative_mod_5) %>% 
+  add_recipe(logistic_alternative_recipe_5)
+logistic_alternative_wflow_5
+```
+
+This does not fit well, use Firth regression instead.
+
+```{r}
+filename <- file.path(model_path, "logistic_alternative_full_5.rds")
+if (! file.exists(filename) || recompute) {
+  logistic_alternative_full_5 <- fit(logistic_alternative_wflow_5, 
+                                 basic2)  # Needs to be unfitted workflow
+  saveRDS(logistic_alternative_full_5, filename)
+} else {
+  logistic_alternative_full_5 <- readRDS(filename)
+}
+logistic_alternative_full_5 %>% extract_fit_engine() %>% summary()
+```
+
+The following produces lots of warnings:
+Warning: glm.fit: fitted probabilities numerically 0 or 1 occurredWarning: glm.fit: fitted probabilities numerically 0 or 1 occurredWarning: glm.fit: fitted probabilities numerically 0 or 1 occurred
+
+Variance inflation factors.
+
+```{r, eval=FALSE}
+logistic_alternative_full_5 %>% extract_fit_engine() %>% car::vif() %>% sort(decreasing = TRUE)
+```
+
+
+```{r}
+filename <- file.path(table_path, "logistic_cis_alternative_full_5.tsv")
+if (! file.exists(filename) || recompute) {
+  logistic_cis_alternative_full_5 <- compute_cis(logistic_alternative_full_5)
+  write_tsv(logistic_cis_alternative_full_5, filename)
+} else {
+  logistic_cis_alternative_full_5 <- read_tsv(filename)
+}
+```
+Warning: glm.fit: fitted probabilities numerically 0 or 1 occurredWarning: glm.fit: fitted probabilities numerically 0 or 1 occurredWarning: glm.fit: fitted probabilities numerically 0 or 1 occurredWarning: glm.fit: fitted probabilities numerically 0 or 1 occurredWarning: glm.fit: fitted probabilities numerically 0 or 1 occurredWarning: collapsing to unique 'x' valuesWarning: collapsing to unique 'x' values
+
+```{r, eval=FALSE}
+#filename <- file.path(figure_path, "logistic_cis_full_5.pdf")
+g <- logistic_cis_alternative_full_5 %>% 
+  # Filter out variables whose confidence intervals were really large
+  filter(! (conf.high > 1e50 | conf.low < 1e-50)) %>%
+  # filter(! term %in% c("donations_in_five_years", "S65C", "sex2_pre", "C282Y_X1_x_S65C", "C282Y_X1_x_donations_in_five_years",
+  #                      "C282Y_X1_x_sex2_pre", "C282Y_X2_x_donations_in_five_years", "C282Y_X2_x_sex2_pre")) %>%
+  plot_cis("Logistic model 5 alternative full FinnGen", subtitle=model_stats(logistic_alternative_full_5)) + labs(y="Variable")
+if (save_figs) {
+  filename <- file.path(figure_path, "logistic_cis_alternative_full_5.pdf")
+  ggsave(filename, g, width=7, height=7)
+}
+g
+```
+
+
+#### Firth's logistic regression.
+
+```{r}
+baked <- logistic_alternative_full_5 %>% extract_recipe() %>% bake(new_data = basic2)
+```
+
+```{r}
+filename <- file.path(model_path, "firth_alternative_full_5.rds")
+if (! file.exists(filename) || recompute) {
+  firth_alternative_full_5 <- logistf(formula = hemochromatosis ~ ., data = baked)
+  saveRDS(firth_alternative_full_5, filename)
+} else {
+  firth_alternative_full_5 <- readRDS(filename)
+}
+```
+
+```{r}
+# Tidy the firth fit object
+# I skip the chi2 statistic since it is a slightly more complicated to compute.
+# See logistf:::summary.logistf
+tidy_firth <- function(firth_fit) {
+  df <- tibble(term = firth_fit$term, 
+               estimate = exp(firth_fit$coefficients),
+               std.error = diag(firth_fit$var)^0.5, 
+               statistic = NA, 
+               p.value = firth_fit$prob,
+               conf.low = exp(firth_fit$ci.lower),
+               conf.high=exp(firth_fit$ci.upper)) %>%
+    filter(term != "(Intercept)")
+  df
+}
+```
+
+
+```{r}
+#capt <- capture.output(s <- summary(firth)) # Summary also prints the results, here we discard it.
+# I skip the chi2 statistic since it is a slightly more complicated to compute.
+# See logistf:::summary.logistf
+filename <- file.path(table_path, "firth_cis_alternative_full_5.tsv")
+if (! file.exists(filename) || recompute) {
+  firth_cis_alternative_full_5 <- tidy_firth(firth_alternative_full_5)
+  write_tsv(firth_cis_alternative_full_5, filename)
+} else {
+  firth_cis_alternative_full_5 <- read_tsv(filename)
+}
+```
+
+```{r, eval=FALSE}
+g <- firth_cis_alternative_full_5 %>% 
+  plot_cis("Firth model 5 alternative full FinnGen") + labs(y="Variable")
+if (save_figs) {
+  filename <- file.path(figure_path, "firth_cis_alternative_full_5.pdf")
+  ggsave(filename, g, width=7, height=7)
+}
+g
+```
+
+#### Combine forest plot
+
+```{r}
+df <- bind_rows(normal = logistic_cis_full_5, 
+                alternative = logistic_cis_alternative_full_5 %>% 
+                  # Filter out variables whose confidence intervals were really large
+                  filter(! (conf.high > 1e50 | conf.low < 1e-50)),
+                alternative_firth=firth_cis_alternative_full_5, .id="model") %>%
+  mutate(model = factor(model, levels=c("normal", "alternative", "alternative_firth")))
+g <- df %>%
+  mutate(model = fct_rev(model)) %>%
+  plot_cis2("Alternative logistic 5 full FinnGen") +
+  guides(color = guide_legend(reverse=TRUE))
+if (save_figs) {
+  filename <- file.path(figure_path, "comparison_cis_alternative_full_5.pdf")
+  ggsave(filename, g, width=7, height=7)
+}
+g
+```
+
+### Binned model
+
+This was pointless exercise.
+
+```{r logistic-mod-5-binned, eval=FALSE}
+logistic_mod_5_binned <- parsnip::logistic_reg()
+logistic_mod_5_binned
+```
+
+
+```{r logistic_recipe-5-binned, eval=FALSE}
+#donation_breaks <- c(0,5,10,15,20,25)
+donation_breaks <- c(0,5,15,25)
+logistic_recipe_5_binned <- 
+  recipe(as.formula(f5), data = train) %>% 
+  step_normalize(age) %>%
+  step_mutate(donation_bin = cut(donations_in_five_years, breaks = donation_breaks, right=FALSE)) %>%
+  step_rm(donations_in_five_years) %>%
+  step_mutate(C282Y = as.factor(C282Y),     # Encode C282Y, H63D and H1-2 as factors
+              H63D  = as.factor(H63D)) %>%
+  step_dummy(all_nominal_predictors(), C282Y, H63D, donation_bin) %>%
+  step_interact(terms = ~ starts_with("C282Y") : c(starts_with("H63D"), S65C, supersnip, #starts_with("donation_bin"), 
+                                                   sex2_pre, sex2_post
+                                                   )) %>%
+  step_lincomb(all_numeric_predictors()) # Removes variables that have exact linear combinations with others
+logistic_recipe_5_binned
+```
+
+
+```{r logistic-workflow-5-binned, eval=FALSE}
+logistic_wflow_5_binned <- 
+  workflow() %>% 
+  add_model(logistic_mod_5_binned) %>% 
+  add_recipe(logistic_recipe_5_binned)
+logistic_wflow_5_binned
+```
+
+This will fit on training data and show performance measures on test data.
+
+```{r last-fit-5-bin, eval=FALSE}
+filename <- file.path(model_path, "logistic_lf_5_binned.rds")
+if (! file.exists(filename) || recompute) {
+  logistic_lf_5_binned <- last_fit(logistic_wflow_5_binned, basic_split)  # Needs to be unfitted workflow
+  saveRDS(logistic_lf_5_binned, filename)
+} else {
+  logistic_lf_5_binned <- readRDS(filename)
+}
+class(logistic_lf_5_binned)
+```
+
+```{r full-fit-5-bin, eval=FALSE}
+filename <- file.path(model_path, "logistic_full_5_binned.rds")
+if (! file.exists(filename) || recompute) {
+  logistic_full_5_binned <- fit(logistic_wflow_5_binned, basic)  # Needs to be unfitted workflow
+  saveRDS(logistic_full_5_binned, filename)
+} else {
+  logistic_full_5_binned <- readRDS(filename)
+}
+```
+
+
+
+
+
+
+Show trained recipe.
+
+```{r, eval=FALSE}
+logistic_lf_5_binned %>% extract_workflow() %>% extract_recipe()
+```
+
+The step_lincomb removed two interactions!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+
+Basic info about the fit.
+
+```{r glance5-binned, eval=FALSE}
+logistic_lf_5_binned %>% extract_workflow() %>% glance()
+```
+
+```{r, eval=FALSE}
+logistic_lf_5_binned %>% extract_workflow() %>% extract_fit_engine() %>% fmsb::NagelkerkeR2()
+```
+
+Variance inflation factors.
+
+```{r logistic-vif-5-binned, eval=FALSE}
+logistic_lf_5_binned %>% extract_workflow() %>% extract_fit_engine() %>% car::vif() %>% sort(decreasing = TRUE)
+```
+
+C282Y and its interaction with H1_2 has very high VIF values!!!
+
+
+
+```{r logistic-cis-5-binned, eval=FALSE}
+filename <- file.path(table_path, "logistic_cis_5_binned.tsv")
+if (! file.exists(filename) || recompute) {
+  logistic_cis_5_binned <- compute_cis(logistic_lf_5_binned %>% extract_workflow())
+  write_tsv(logistic_cis_5_binned, filename)
+} else {
+  logistic_cis_5_binned <- read_tsv(filename)
+}
+```
+
+```{r logistic-cis-plot-5-binned, eval=FALSE}
+#| fig-cap: The age is at first event for cases and at death or EOF for controls.
+filename <- file.path(figure_path, "logistic_cis_5.pdf")
+g <- plot_cis(logistic_cis_5, "Logistic model 5 FinnGen", subtitle=model_stats(logistic_lf_5)) + labs(y="Variable")
+##ggsave(file.path(figure_path, "poster", "logistic_cis_5.pdf"), g + theme(plot.title=element_blank(), axis.title.y.left = element_blank()))
+if (save_figs)
+  ggsave(filename, g, width=7, height=7)
+g
+```
+
+```{r logistic-cis-full-5-binned, eval=FALSE}
+filename <- file.path(table_path, "logistic_cis_full_5.tsv")
+if (! file.exists(filename) || recompute) {
+  logistic_cis_full_5 <- compute_cis(logistic_full_5)
+  write_tsv(logistic_cis_full_5, filename)
+} else {
+  logistic_cis_full_5 <- read_tsv(filename)
+}
+```
+
+```{r logistic-cis-full-plot-5-binned, eval=FALSE}
+#| fig-cap: The age is at first event for cases and at death or EOF for controls.
+filename <- file.path(figure_path, "logistic_cis_full_5.pdf")
+g <- plot_cis(logistic_cis_full_5, "Logistic model 5 full FinnGen", subtitle=model_stats(logistic_full_5)) + labs(y="Variable")
+#ggsave(file.path(figure_path, "poster", "logistic_cis_5.pdf"), g + theme(plot.title=element_blank(), axis.title.y.left = element_blank()))
+if (save_figs)
+  ggsave(filename, g, width=7, height=7)
+g
+```
+
+### Model 5 C282Y wild only
+
+```{r}
+variables5_wild <- c("sex2", "age", "donations_in_five_years", 
+                "H63D", "S65C", 
+                "C282Y", 
+                "H1_2",
+                "supersnip",
+                #credible_snip_names,
+                disease_names,
+                "credible1",
+                "rs3094093", "rs114179634"#, "rs9261354"  # HLA snips
+                )
+f5_wild <- sprintf("hemochromatosis ~ %s", paste(variables5_wild, collapse=" + "))
+f5_wild
+```
+
+```{r logistic-mod-5-wild}
+logistic_mod_5 <- parsnip::logistic_reg()
+logistic_mod_5
+```
+
+
+```{r logistic_recipe-5-wild}
+my_dummy_names <- function(var, lvl, ordinal=FALSE, sep="_") {
+  conv <- list(`0`="ref", `1`="hetero", `2`="homo")
+  if (ordinal) stop("Not implemented")
+  paste(var, conv[as.character(lvl)] %>% unlist() %>% unname(), sep = sep)
+}
+logistic_recipe_5_wild <- 
+  recipe(as.formula(f5_wild), data = train) %>%
+  step_filter(C282Y == 0) %>%   # non-carriers only
+  step_rm(C282Y) %>%
+  #step_rm(H1_2) %>%
+  #step_relevel(hemochromatosis, ref_level = "control") %>%
+  step_normalize(age) %>%
+  step_mutate(#C282Y = as.factor(C282Y),     # Encode C282Y, H63D and H1-2 as factors
+              H63D  = as.factor(H63D), #) %>%
+              H1_2  = as.factor(H1_2)
+              ) %>%
+  step_dummy(all_nominal_predictors(), H63D) %>%
+  # step_interact(terms = ~ starts_with("C282Y") : c(starts_with("H63D"), S65C, supersnip, donations_in_five_years, sex2_pre, sex2_post
+  #                                                  #rs3094093, rs114179634,
+  #                                                  )) %>%
+  step_lincomb(all_numeric_predictors()) # Removes variables that have exact linear combinations with others
+#  step_interact(terms = ~ H63D:C282Y + H1_2:C282Y + S65C:C282Y + supersnips:C282Y)
+logistic_recipe_5_wild
+```
+
+
+```{r logistic-workflow-5-wild}
+logistic_wflow_5_wild <- 
+  workflow() %>% 
+  add_model(logistic_mod_5) %>% 
+  add_recipe(logistic_recipe_5_wild)
+logistic_wflow_5_wild
+```
+
+
+
+This will fit on training data and show performance measures on test data.
+
+```{r last-fit-5-wild}
+filename <- file.path(model_path, "logistic_lf_5_wild.rds")
+if (! file.exists(filename) || recompute) {
+  logistic_lf_5_wild <- last_fit(logistic_wflow_5_wild, basic_split)  # Needs to be unfitted workflow
+  saveRDS(logistic_lf_5_wild, filename)
+} else {
+  logistic_lf_5_wild <- readRDS(filename)
+}
+class(logistic_lf_5_wild)
+```
+
+
+```{r, eval=FALSE}
+collect_metrics(logistic_lf_5_wild)
+```
+
+Use Dharma to check some diagnostics.
+
+```{r, eval=FALSE}
+simulated_5_wild <- DHARMa::simulateResiduals(logistic_lf_5_wild %>% extract_fit_engine())
+plot(simulated_5_wild)
+```
+
+I don't know how to interpret the right side panel, but it doesn't look like it should. Why is there no messages printed?
+
+Let's check the diagnostics with the performance package.
+
+```{r, eval=FALSE}
+filename <- file.path(model_path, "logistic_lf_5_wild.check_model.rds")
+if (! file.exists(filename)) {
+  res <- logistic_lf_5_wild %>% extract_fit_engine() %>% performance::check_model()
+  saveRDS(res, filename)
+} else {
+  res <- readRDS(filename)
+}
+res
+```
+
+The binned residuals look terrible. Let's try to plot them per each predictor.
+
+```{r, eval=FALSE}
+logistic_lf_5_wild %>% extract_fit_engine() %>% performance::binned_residuals(term = "age") %>% plot()
+```
+
+
+```{r, eval=FALSE}
+logistic_lf_5_wild %>% extract_fit_engine() %>% performance::binned_residuals(term = "donations_in_five_years") %>% plot()
+```
+
+Confidence intervals for the performance measures using percentile method.
+
+```{r logistic-perf-5-wild, eval=FALSE}
+# Use 10 bootstrap samples
+logistic_perf_5_wild <- int_pctl(logistic_lf_5_wild, times=10, 
+                            metrics = yardstick::metric_set(accuracy, brier_class, roc_auc, pr_auc)) %>% 
+  mutate(model="Logistic regression 5 wild")
+logistic_perf_5_wild
+```
+
+
+Show trained recipe.
+
+```{r}
+logistic_lf_5_wild %>% extract_workflow() %>% extract_recipe()
+```
+
+
+
+Basic info about the fit.
+
+```{r glance5_wild}
+logistic_lf_5_wild %>% extract_workflow() %>% glance()
+```
+
+
+Variance inflation factors.
+
+```{r logistic-vif-5-wild}
+logistic_lf_5_wild %>% extract_workflow() %>% extract_fit_engine() %>% car::vif() %>% sort(decreasing = TRUE)
+```
+
+
+R2 value.
+
+```{r}
+logistic_lf_5_wild %>% extract_workflow() %>% extract_fit_engine() %>% fmsb::NagelkerkeR2()
+```
+
+```{r logistic-cis-5-wild}
+filename <- file.path(table_path, "logistic_cis_5_wild.tsv")
+if (! file.exists(filename) || recompute) {
+  logistic_cis_5_wild <- compute_cis(logistic_lf_5_wild %>% extract_workflow())
+  write_tsv(logistic_cis_5_wild, filename)
+} else {
+  logistic_cis_5_wild <- read_tsv(filename)
+}
+```
+
+
+
+Computing confidence intervals resulted in warnings: glm.fit: fitted probabilities numerically 0 or 1 occurred.
+
+What to do in these situations?
+https://stackoverflow.com/questions/67360883/how-to-fix-fitted-probabilities-numerically-0-or-1-occurred-warning-in-r
+
+Check if there are separation issues.
+
+```{r, eval=FALSE}
+my_fit <- function(recipe, data, scale = FALSE, method = "detect_separation") {
+  # method could be "detect_separation" or "glm.fit"
+  preprocessed <- recipe %>% bake(data)
+  if (scale)
+    preprocessed <- preprocessed %>% mutate(across(-hemochromatosis, scale))
+  #preprocessed <- preprocessed %>% mutate(hemochromatosis = as.numeric(hemochromatosis=="case"))
+  fit <- glm(hemochromatosis ~ ., data = preprocessed, family = binomial, method=method)
+}
+```
+
+```{r, eval=FALSE}
+filename <- file.path(model_path, "detect_separation_5_wild.rds")
+if (! file.exists(filename)) {
+  fit_separation <- my_fit(logistic_lf_5_wild %>% extract_workflow() %>% extract_recipe(), train)
+  saveRDS(fit_separation, filename)
+} else {
+  fit_separation <- readRDS(filename)
+}
+fit_separation
+```
+
+Checking that this produces the same result as with tidymodels.
+
+Note: apparently bake() does not perform step step_filter(), unless skip parameter is set to FALSE.
+
+```{r, eval=FALSE}
+fit <- my_fit(logistic_lf_5_wild %>% extract_workflow() %>% extract_recipe(), train %>% filter(C282Y==0), method="glm.fit")
+cis <- compute_cis(fit)
+plot_cis(cis,
+         "Logistic model 5 wild (lm)", subtitle=model_stats(logistic_lf_5_wild)) + labs(y="Variable")
+```
+
+No separation detected. Scaling variables did not help. Dharma results were hard to interpret.
+Maybe confidence intervals can be computed using some other method, such as parameters::parameters. But that does not compile currently in
+CRAN.
+
+```{r logistic-cis-wild-plot-5}
+#| fig-cap: The age is at first event for cases and at death or EOF for controls.
+filename <- file.path(figure_path, "logistic_cis_5_wild.pdf")
+g <- plot_cis(logistic_cis_5_wild, "Logistic model 5 wild FinnGen", subtitle=model_stats(logistic_lf_5_wild)) + labs(y="Variable")
+if (save_figs) {
+  ggsave(file.path(figure_path, "poster", "logistic_cis_5_wild.pdf"), 
+         g + theme(plot.title=element_blank(), axis.title.y.left = element_blank()))
+  ggsave(filename, g, width=7, height=7)
+}
+g
+```
+
+### Model 5 XGboost
+
+
+
+```{r}
+# These hyperparameters should be optimised!!!!!!!!!!!!!!!!!
+xg_mod_5 <- boost_tree(learn_rate = 0.1, trees = 100) |>
+  set_mode("classification") |> 
+  set_engine("xgboost", verbose = 0)
+```
+
+
+```{r}
+xg_recipe_5 <- #logistic_recipe_5_pre %>%
+  recipe(as.formula(f5), data = xg_train) %>% 
+  #step_relevel(hemochromatosis, ref_level = "control") %>%
+  step_normalize(age) %>%
+  step_integer(all_nominal_predictors(), all_of(disease_names), zero_based=TRUE) %>%
+  step_lincomb(all_numeric_predictors()) # Removes variables that have exact linear combinations with others
+xg_recipe_5
+```
+
+From
+https://modeloriented.github.io/shapviz/articles/tidymodels.html
+Remark: Dont use 1:m transforms such as One-Hot-Encodings. They are usually not necessary and make the workflow more complicated. If you cant avoid this, check the collapse argument in shapviz().
+
+```{r xg-workflow-5}
+xg_wflow_5 <- 
+  workflow() %>% 
+  add_model(xg_mod_5) %>% 
+  add_recipe(xg_recipe_5)
+xg_wflow_5
+```
+
+```{r}
+filename <- file.path(model_path, "xg_fit_5.rds")
+if (! file.exists(filename) || recompute) {
+  tic("Fitting XGboost model")
+  xg_fit_5 <- xg_wflow_5 %>% fit(xg_train)
+  saveRDS(xg_fit_5, filename)
+  toc()
+} else {
+  xg_fit_5 <- readRDS(filename)
+}
+class(xg_fit_5)
+```
+
+Took 30 seconds.
+
+```{r, eval=FALSE}
+xg_fit_5 %>% extract_fit_engine() %>% fmsb::NagelkerkeR2()
+```
+
+```{r}
+xg_fit_5 %>% extract_recipe()
+```
+
+#### Performance measures
+
+Note that the "positive" level needs to be specified using the event_level option. The default is the first level, which is control in our case,
+which is not what we want.
+
+```{r, eval=FALSE}
+#xg_fit_5 %>% augment(new_data=xg_train) %>% pr_curve(hemochromatosis, .pred_case, event_level = "first") %>% autoplot()
+```
+
+```{r}
+res <- performance_curves(xg_fit_5, "xgboost 5 train", new_data = xg_train, event_level = "first")
+res[[1]] + res[[2]]
+```
+
+
+
+Cases as positive event.
+
+```{r}
+xg_perf1 <- xg_fit_5 %>% augment(new_data=xg_train) %>% mymetrics_rev(hemochromatosis, .pred_case, estimate=.pred_class)
+
+logistic_perf1 <- logistic_lf_5 %>% 
+  extract_workflow() %>%
+  augment(new_data=train) %>% #mutate(hemochromatosis = fct_relevel(hemochromatosis, c("control", "case")))) %>% 
+  mymetrics(hemochromatosis, .pred_case, estimate=.pred_class)
+bind_rows(xg=xg_perf1, logistic=logistic_perf1, .id = "model") %>% pivot_wider(names_from=model, values_from=.estimate) %>% select(-.estimator)
+```
+
+  
+As a sanity check, try with control as positive events.
+
+```{r}
+xg_perf2 <- xg_fit_5 %>% augment(new_data=xg_train) %>% mymetrics_rev(hemochromatosis, .pred_control, estimate=.pred_class)
+
+logistic_perf2 <- logistic_lf_5 %>%
+  extract_workflow() %>%
+  augment(new_data=train) %>% #mutate(hemochromatosis = fct_relevel(hemochromatosis, c("control", "case")))) %>% 
+  mymetrics(hemochromatosis, .pred_control, estimate=.pred_class)
+bind_rows(xg=xg_perf2, logistic=logistic_perf2, .id = "model") %>% pivot_wider(names_from=model, values_from=.estimate) %>% select(-.estimator)
+```
+
+Obtain more accurate performance measures using cross validation.
+
+```{r}
+filename <- file.path(model_path, "logistic_resamples_5.rds")
+if (! file.exists(filename) || recompute) {
+  tic("Resampling for logistic 5")
+  logistic_resamples_5 <- 
+    logistic_wflow_5 %>% 
+    fit_resamples(folds, metrics = mymetrics, control = control_resamples(save_pred = TRUE, event_level="second"))
+  toc()
+  saveRDS(logistic_resamples_5, filename)
+} else {
+  logistic_resamples_5 <- readRDS(filename)
+}
+collect_metrics(logistic_resamples_5)
+```
+
+Note that the below AUROC and  AUPR values are slightly different than above. This is because below we have formed the two curves
+based on out-of-sample predictions, whereas above we have taken the average of the areas under the ten curves.
+
+```{r}
+res <- performance_curves(logistic_resamples_5, "logistic 5 CV")
+res[[1]] + res[[2]]
+```
+
+```{r}
+filename <- file.path(model_path, "xg_resamples_5.rds")
+if (! file.exists(filename) || recompute) {
+  xg_resamples_5 <- 
+    xg_wflow_5 %>% 
+    fit_resamples(xg_folds, metrics = mymetrics_rev, control = control_resamples(save_pred = TRUE, event_level="first"))
+  saveRDS(xg_resamples_5, filename)
+} else {
+  xg_resamples_5 <- readRDS(filename)
+}
+collect_metrics(xg_resamples_5)
+```
+
+```{r}
+res <- performance_curves(xg_resamples_5, "xgboost 5 CV", event_level="first")
+res[[1]] + res[[2]]
+```
+
+The performance measures as a plot.
+
+```{r}
+performance_measures <- list(logistic = collect_metrics(logistic_resamples_5), xg = collect_metrics(xg_resamples_5)) %>%
+  bind_rows(.id = "model")
+```
+
+```{r}
+performance_measures %>% 
+  ggplot(aes(x=mean, xmin=mean-std_err, xmax=mean+std_err, y=.metric, color=model)) + 
+  geom_pointrange(position=position_dodge(width=0.3)) +
+  labs(y="Metric", x="Mean", title="Performance")
+```
+
+Huge difference in brier classification metric between the two models!
+
+#### SHAP analysis
+
+```{r}
+set.seed(43)
+xg_explain_5 <- xg_train %>% 
+  #head(n=1000) %>% 
+  slice_sample(n=10000) #%>%
+  #mutate(hemochromatosis = fct_relevel(hemochromatosis, c("control", "case")))
+X_pred <- bake(  # goes to xgboost:::predict.xgb.Booster()
+  xg_fit_5 %>% extract_recipe(), 
+  has_role("predictor"),
+  new_data = xg_explain_5,
+  composition = "matrix"
+)
+
+#stopifnot(colnames(X_pred) %in% colnames(xg_explain_5))
+```
+
+Compute the SHAP values.
+
+```{r}
+# Note, the which_class parameter works only for multiclass classification, not for binary classification.
+# shapviz assumes that the first level is the positive class. That cannot be changed, so we have
+# to accept, that the directions of effects are opposite here.
+tic("Computing shap values")
+set.seed(158)
+shap_values <- xg_fit_5 %>% extract_fit_engine() %>%
+  shapviz(X_pred = X_pred, X = xg_explain_5, which_class=1, interactions = TRUE) #|> 
+  #setNames(levels(iris$Species))
+toc()
+```
+
+
+
+```{r}
+shap_values %>% 
+  sv_importance() +
+  ggtitle("SHAP importance")
+```
+
+Store importances to file.
+
+```{r}
+xg_importance_5 <- shap_values %>% sv_importance(kind="no") %>% enframe()
+if (save_tables) {
+  filename <- file.path(table_path, "xg_importance_5.tsv")
+  write_tsv(xg_importance_5, filename)
+}
+xg_importance_5
+```
+
+```{r}
+shap_values |> 
+  sv_importance(kind = "bee") +
+  ggtitle("SHAP importance")
+```
+
+```{r, eval=FALSE}
+shap_values |> 
+  sv_dependence(v = "C282Y", color_var = "age") +
+  plot_layout(ncol = 1, guides = "collect")
+```
+
+
+```{r}
+xvars <- c("sex2", "age", "donations_in_five_years" , "H63D", "S65C", "C282Y", "supersnip", "credible1", "credible2", "credible3", "rs3094093", "rs114179634", disease_names)
+shap_values |> 
+  sv_dependence(xvars, color_var = NULL) +
+  plot_annotation("SHAP importance")
+  #plot_layout(ncol = 1, guides = "collect")
+```
+
+Dependence. The variable that is mapped to colors is the one with strongest interaction with the feature in question.
+
+```{r, fig.width=10}
+shap_values |> 
+  sv_dependence(xvars, color_var = "auto") +
+  plot_annotation("Dependence")
+```
+
+Pure interactions.
+
+```{r, fig.width=10}
+shap_values |> 
+  sv_dependence(xvars, color_var = "auto", interactions = TRUE) +
+  plot_annotation("Pure interactions")
+```
+
+Let's look more closely at the interactions of "donations in five years".
+
+```{r, fig.width=10}
+shap_values |> 
+  sv_dependence("donations_in_five_years", color_var = xvars, interactions = TRUE) +
+  plot_annotation("Pure interactions of donations in five years")
+```
+
+
+### Bayesian model 5
+
+```{r logistic-mod-5b}
+#logistic_mod_5b <- parsnip::logistic_reg()
+logistic_mod_5b <- bayesian::bayesian(family="bernoulli", chains=4, cores=4, iter=2000) %>%  # This needs to be bernoulli, not binomial
+  set_engine("brms") %>%
+  set_mode("classification")
+logistic_mod_5b
+```
+
+```{r, eval=FALSE}
+logistic_recipe_5b <- logistic_recipe_5 %>%
+  step_mutate(hemochromatosis = if_else(hemochromatosis=="case", 1, 0)) # brms requires numeric response
+```
+
+
+```{r logistic-workflow-5b}
+logistic_wflow_5b <- 
+  workflow() %>% 
+  add_model(logistic_mod_5b) %>% 
+  add_recipe(logistic_recipe_5)
+logistic_wflow_5b
+```
+
+This will fit on training data and show performance measures on test data.
+
+```{r last-fit-5b}
+filename <- file.path(model_path, "logistic_lf_5b.rds")
+if (! file.exists(filename) || recompute_bayes) {
+  tic("Fit Bayesian model")
+  logistic_lf_5b <- last_fit(logistic_wflow_5b, basic_split)  # Needs to be unfitted workflow
+  toc()
+  saveRDS(logistic_lf_5b, filename)
+} else {
+  logistic_lf_5b <- readRDS(filename)
+}
+class(logistic_lf_5b)
+```
+
+Got warnings/errors:
+
+→ A | error:   Assigned data `orig_rows` must be compatible with existing data.
+               ✖ Existing data has 824180 rows.
+               ✖ Assigned data has 206045 rows.
+               ℹ Only vectors of size 1 are recycled.
+               Caused by error in `vectbl_recycle_rhs_rows()`:
+               ! Can't recycle input of size 206045 to size 824180.
+There were issues with some computations   A: x1
+Warning: All models failed. Run `show_notes(.Last.tune.result)` for more information.
+
+Fit Bayesian model: 1196.146 sec elapsed
+
+```{r, eval=FALSE}
+p <- logistic_lf_5b %>% extract_workflow() %>% augment(new_data = data5_test)
+baked <- logistic_lf_5b %>% extract_recipe() %>% bake(data5_test)
+p <- logistic_lf_5b %>% extract_fit_engine() %>% augment()
+p2 <- logistic_lf_5b %>% extract_fit_engine() %>% augment(newdata = baked)   # This produces labels
+x <- logistic_lf_5b %>% extract_fit_engine() %>% posterior_epred(newdata = baked, summary=FALSE)  # This gives probabilities
+
+```
+
+
+```{r, eval=FALSE}
+collect_metrics(logistic_lf_5b)
+```
+
+```{r, message=FALSE, warning=FALSE}
+
+extract_variables_names <- function(fit) {
+  a <- as.array(fit)
+  v <- attr(a, "dimnames")$variable
+  return(setdiff(v, c("b_Intercept", "lp__")))
+}
+forest_plot <- function(fit, id, save_figs=FALSE) {
+  bvariables <- extract_variables_names(fit)
+  p <- mcmc_plot(fit, 
+                 type = "areas",
+                 prob = 0.95,
+                 variable = bvariables,
+                 area_method = "equal area",
+                 transformations = "exp"
+  ) +
+    geom_vline(xintercept = 1, color = "grey") +
+    labs(x="Odds ratio") + 
+    scale_x_log10()
+  if (save_figs) {
+    filename <- sprintf("%s/bayesian_area_plots_%s.png", fig_path, id)
+    ggsave(filename=filename,  plot=p, width = 180,  height = 120, units="mm", dpi=300, scale=1.0, device="png")
+  }
+  p
+}
+
+# This self-made version has pretty labels unlike the previous function
+forest_plot2 <- function(fit, id, descript, scale=1, variables=NULL) {
+  #scale <- 3000
+  #scale <- 0.9
+  #bvariables = if (id=="all") bvariables else setdiff(bvariables, "b_femaleTRUE")
+  if (is.null(variables)) {
+    bvariables <- extract_variables_names(fit)
+  } else {
+    bvariables <- paste("b", variables, sep="_")
+  }
+  a <- as.array(fit, variable=bvariables)
+  tmp <- bayesplot::mcmc_areas_data(a, 
+                         prob = 0.95,
+                         area_method = "equal area",
+                         #variable = variables2,
+                         transformations = "exp"
+  )
+  
+  tmp2 <- tmp %>% 
+    filter(parameter != "exp(b_intercept)") %>% 
+    filter(parameter != "exp(Intercept)") %>% 
+    filter(parameter != "exp(lprior)") %>% 
+    mutate(name = str_match(parameter, "exp\\(b_(.*)\\)")[,2]) %>%
+    left_join(descript, by="name") %>%
+    mutate(Pretty = ifelse(is.na(value), name, value)) %>%
+    mutate(Pretty = as.factor(Pretty))
+  g2 <- tmp2 %>% 
+    mutate(Pretty = fct_rev(Pretty)) %>%
+    filter(interval == "inner") %>% 
+    #filter(str_detect(parameter, r"(exp\(b_.*\))")) %>% 
+    ggplot(aes(x=x, y=Pretty, height=plotting_density)) + 
+    ggridges::geom_ridgeline(scale=scale) +
+    ggridges::geom_ridgeline(mapping=aes(x=x, y=Pretty, height=plotting_density), 
+                   data=tmp2 %>% filter(interval=="outer"), 
+                   fill=NA, scale=scale) +
+    scale_y_discrete() +
+    labs(x="Odds ratio", y="Variable") +
+    scale_x_log10()
+  g2
+}
+
+```
+
+```{r}
+forest_plot(logistic_lf_5b %>% extract_fit_engine(), "sika", save_figs = FALSE)
+```
+
+```{r, fig.width=10, fig.height=7}
+g <- forest_plot2(logistic_lf_5b %>% extract_fit_engine(), "sika", pretty_conv %>% enframe(), scale=3000)
+g2 <- g + 
+  geom_vline(xintercept = 1, color="gray") +
+  geom_pointrange(data=logistic_cis_5 %>% mutate(Pretty = coalesce(pretty_conv[term], term)), 
+                  mapping=aes(x=estimate, xmin=conf.low, xmax=conf.high, y=Pretty), inherit.aes = FALSE, color="red")
+if (save_figs) {
+  filename <- file.path(figure_path, "logistic_cis_5_combined.pdf")
+  ggsave(filename, g2, width=10, height=7)
+}
+g2
+```
+
+```{r}
+g <- forest_plot2(logistic_lf_5b %>% extract_fit_engine(), "sika", pretty_conv %>% enframe(), scale=1,
+                  variables=c("rs3094093", "rs114179634"))#, "rs9261354"))
+g + geom_vline(xintercept = 1, color="gray")
+```
+
+Show just 95% intervals instead of distributions.
+
+```{r logistic-cis-5b}
+filename <- file.path(table_path, "logistic_cis_5b.tsv")
+if (! file.exists(filename) || recompute) {
+  logistic_cis_5b <- compute_cis(logistic_lf_5b %>% extract_workflow())
+  write_tsv(logistic_cis_5b, filename)
+} else {
+  logistic_cis_5b <- read_tsv(filename)
+}
+```
+
+```{r}
+plot_double_cis <- function(cis, title) {
+  cis %>% 
+    mutate(term = str_remove(term, "TRUE"),
+           term = fct_relevel(term, intersect(names(pretty_conv), term)),
+           #term = fct_recode(!!pretty_conv), 
+           term = fct_relabel(term, ~ coalesce(pretty_conv[.x], .x)),
+           term = fct_rev(term),
+           color = method,
+           hollow_color = if_else(conf.low < 1 & conf.high > 1, NA, method)) %>%
+    ggplot(aes(x=estimate, xmin=conf.low, xmax=conf.high, y=term, color=color, fill=hollow_color)) + 
+    geom_vline(xintercept = 1, color="gray") +
+    geom_linerange(position = position_dodge(1)) + 
+    geom_point(shape=21, size=3, position = position_dodge(1)) +
+    scale_fill_discrete(na.value=NA, guide="none") +  
+    scale_x_log10() +
+    labs(title=title, x="Odds ratio", y="Variable")
+}
+```
+
+
+```{r}
+g <- bind_rows(Frequentist=logistic_cis_5, Bayesian=logistic_cis_5b, .id = "method") %>%
+  plot_double_cis("Logistic model 5 frequentist and Bayesian") +
+  labs(color="Method")
+if (save_figs) {
+  filename <- file.path(figure_path, "logistic_cis_5_combined2.pdf")
+  ggsave(filename, g, width=10, height=7)
+}
+g
+```
+
+### Cox regression
+
+Time-dependent covariates model.
+
+```{r}
+#starts_with("C282Y") : c(starts_with("H63D"), S65C, supersnip, donations_in_five_years, sex2_pre, sex2_post
+baseline_variables5 <- c("H63D", "S65C", "C282Y", 
+                        "supersnip",
+                        credible_snip_names,
+                        "rs3094093", "rs114179634")
+interaction_variables5 <-  "C282Y:(H63D + S65C + supersnip + sex2 + donations_in_five_years)"
+time_dependent_variables <- c("sex2", "donations_in_five_years", disease_names)
+variables5_cox_tdc <- c(baseline_variables5, interaction_variables5, time_dependent_variables)
+# f5_cox <- as.formula(sprintf("Surv(age, hemochromatosis) ~ %s", paste(variables5_cox_tdc, collapse=" + ")))
+# f5_cox
+#variables5_cox_tdc <- c(baseline_variables5, "donations_in_five_years", "sex2")
+f5_cox_tdc <- as.formula(sprintf("Surv(tstart, tstop, status) ~ %s", paste(variables5_cox_tdc, collapse=" + ")))
+f5_cox_tdc
+
+```
+
+
+Get ages at previous disease events.
+
+```{r}
+filename <- file.path(result_path, "prior_endpoint_events_new.tsv.gz")
+first_disease_ages <- read_tsv(filename, col_select = c(sample="FINNGENID", age="EVENT_AGE", endpoint="ENDPOINT"))
+first_disease_ages <- first_disease_ages %>%
+  group_by(sample, endpoint) %>%
+  slice_min(order_by = age, n=1) %>%
+  ungroup()
+```
+
+The time intervals are half-open. If the value of some covariate changes at time t1, then the value is valid
+in the interval (t1,t2], where t2 is the next timepoint.
+
+```{r}
+# Called for every person separately
+dynamic_five_year_donations <- function(donation_ages) {
+  stopifnot(is.numeric(donation_ages))
+  # The value of donations_in_five_years changes at blood donation and five years after blood donation
+  ages <- c(donation_ages, donation_ages+5) %>% unique() %>% sort()
+  res <- tibble(age=ages) %>%
+    mutate(next_age = lead(age, default=1000)) %>%
+    filter(! near(age, next_age))    # Fitting does not work if time intervals are too short
+  res <- res <- res %>%
+    mutate(donations_in_five_years = 
+             map_int(age, 
+                     function(age) {sum(((age - 5) < donation_ages) & (donation_ages <= age) ) })
+           )
+  res
+}
+```
+
+
+```{r}
+# Forms data for time-dependent covariate survival model
+form_survival_data <- function(data) 
+{
+    # Baseline covariates and response
+  tdc1 <- tmerge(data1 = data %>% select(sample, all_of(baseline_variables5)) %>%     # baseline covariates
+                   mutate(across(c(C282Y, H63D), as.factor)),
+                 data2 = data %>% select(sample, hemochromatosis, age) %>%            # response
+                   mutate(hemochromatosis = as.integer(hemochromatosis=="case")),
+                 id=sample, tstop=age, status = event(age, hemochromatosis))
+  ## Add time-dependent variables
+  # Donation count
+  #dons <- donations %>% #arrange(APPROX_DONATION_DATE) %>% group_by(sample) %>% mutate(i = 1:n()) %>% ungroup() %>%
+  #  mutate(sex2 = create_sex2(SEX, donation_age))
+  
+  # Add diseases
+  tdc2 <- tmerge(data1 = tdc1,
+                 data2 = first_disease_ages %>% filter(endpoint == "C3_CANCER") %>% select(sample, age),
+                 id = sample,
+                 C3_CANCER = tdc(age),
+                 options = list(delay = 5))
+
+  tdc2 <- tmerge(data1 = tdc2,
+                 data2 = first_disease_ages %>% filter(endpoint == "E4_HYTHYNAS") %>% select(sample, age),
+                 id = sample,
+                 E4_HYTHYNAS = tdc(age),
+                 options = list(delay = 5))
+
+  tdc2 <- tmerge(data1 = tdc2,
+                 data2 = first_disease_ages %>% filter(endpoint == "I9_HYPTENSESS") %>% select(sample, age),
+                 id = sample,
+                 I9_HYPTENSESS = tdc(age),
+                 options = list(delay = 1))
+  
+  tdc2 <- tmerge(data1 = tdc2,
+                 data2 = first_disease_ages %>% filter(endpoint == "K11_CHOLELITH") %>% select(sample, age),
+                 id = sample,
+                 K11_CHOLELITH = tdc(age),
+                 options = list(delay = 5))
+  
+  tdc2 <- tmerge(data1 = tdc2,
+                 data2 = first_disease_ages %>% filter(endpoint == "M13_ARTHROSIS") %>% select(sample, age),
+                 id = sample,
+                 M13_ARTHROSIS = tdc(age),
+                 options = list(delay = 1))
+  
+  # Add variables premenopausal and postmenopausal
+  females <- data %>% select(sample, sex) %>% filter(sex == "female")
+  df <- tibble(age=c(0, 50), sex2=c("pre", "post"))
+  sex2 <- females %>% mutate(df = list(df)) %>% unnest(df)
+  tdc3 <- tmerge(data1 = tdc2,
+                 data2 = sex2,
+                 id = sample,
+                 sex2 = tdc(age, sex2, "male"))  # tdc(age, value, init)
+  # postmenopausal <- females %>% mutate(age = 50)
+  # tdc3 <- tmerge(data1 = tdc2,
+  #                data2 = postmenopausal,
+  #                id = sample,
+  #                post = tdc(age))
+  # 
+  # df <- tibble(age=c(0, 50), premenopausal=c(1, 0))
+  # premenopausal <- females %>% mutate(df = list(df)) %>% unnest(df)
+  # tdc3 <- tmerge(data1 = tdc3,
+  #                data2 = premenopausal,
+  #                id = sample,
+  #                pre = tdc(age, premenopausal, 0))  # tdc(age, value, init)
+  
+  # Add the donations in five years
+
+  # Nest donation ages as a list
+  don <- donations %>% select(sample, donation_age) %>% group_by(sample) %>% summarise(donation_ages = list(donation_age))
+  
+  # Nest time window endpoints as a list
+  #ages <- tdc3 %>% select(sample, tstop) %>% group_by(sample) %>% summarise(ages = list(tstop))
+  
+  #df <- inner_join(don, ages, by="sample")
+  donations_in_five_years <- don %>% #head(1000) %>% 
+    rowwise() %>% 
+    mutate(tmp = list(dynamic_five_year_donations(donation_ages))) %>% 
+    ungroup() %>%
+    select(-c(donation_ages)) %>% 
+    unnest(tmp)
+
+  tdc4 <- tmerge(data1 = tdc3,
+                 data2 = donations_in_five_years,
+                 id = sample,
+                 donations_in_five_years = tdc(age, donations_in_five_years, 0))
+  
+  tdc4 
+  # Below is the old version.
+  
+  # Note that this current implementation is not really correct: When the menopause event is added, 
+  # the value of donations_in_five_years should change as well.
+  # tdc2 <- tmerge(data1=tdc1, 
+  #                data2=donations,
+  #                id=sample, 
+  #                donations_in_five_years=tdc(donation_age, donations_in_five_years, 0))
+  # sex2 variable
+  # menopauses1 <- data %>% select(sample, sex) %>% mutate(age = 0, sex2 = if_else(sex=="male", "male", "pre"))
+  # menopauses2 <- data %>% select(sample, sex) %>% mutate(age = 50, sex2 = if_else(sex=="male", "male", "post"))
+  # menopauses <- bind_rows(menopauses1, menopauses2)                                                       
+  # tdc3 <- tmerge(data1=tdc2,
+  #                data2=menopauses,
+  #                id=sample,
+  #                sex2=tdc(age, sex2))
+  # tdc3
+}
+```
+
+
+```{r}
+filename <- file.path(result_path, "tdc_train.rds")
+if (recompute || ! file.exists(filename)) {
+  tdc_train <- form_survival_data(train)
+  saveRDS(tdc_train, filename)
+} else {
+  tdc_train <- readRDS(filename)
+}
+```
+
+```{r}
+filename <- file.path(result_path, "tdc_full.rds")
+if (recompute || ! file.exists(filename)) {
+  tdc_full <- form_survival_data(basic)
+  saveRDS(tdc_full, filename)
+} else {
+  tdc_full <- readRDS(filename)
+}
+```
+
+#### Fit on train data.
+
+```{r}
+filename <- sprintf("%s/cox_fit_5.rds", model_path)
+if (recompute | !file.exists(filename)) {
+  cox_tdc_fit_5 <- coxph(f5_cox_tdc, tdc_train)
+  saveRDS(cox_tdc_fit_5, file=filename)
+} else {
+  cox_tdc_fit_5 <- readRDS(filename)
+}
+cox_tdc_fit_5
+```
+
+
+
+```{r Compute time-dependent covariate Cox model effect sizes}
+filename <- sprintf("%s/cox_tdc_cis_5.tsv", table_path)
+if (recompute | !file.exists(filename)) {
+  cox_tdc_cis_5 <- tidy(cox_tdc_fit_5, conf.int = TRUE, exponentiate = TRUE) %>%
+    drop_na(estimate)    # Some interacting levels don't exist in the date, we drop them here
+  write_tsv(cox_tdc_cis_5, file=filename)
+} else {
+  cox_tdc_cis_5 <- read_tsv(filename)
+}
+```
+
+
+```{r Plot time-dependent covariate Cox model effect sizes}
+g <- plot_cis(cox_tdc_cis_5, "Time-dependent Cox model 5 FinnGen") + 
+  labs(x="Hazard ratio") +
+  theme(axis.title.y = element_blank())
+if (save_figs) {
+  filename <- sprintf("%s/cox_tdc_cis_5.png", figure_path)
+  ggsave(filename=filename,  plot=g, width = 180,  height = 120, units="mm", dpi=300, scale=1.0, device="png")
+}
+g
+```
+
+#### Fit on full data
+
+Fit on full data.
+
+```{r}
+filename <- sprintf("%s/cox_full_5.rds", model_path)
+if (recompute | !file.exists(filename)) {
+  cox_tdc_full_5 <- coxph(f5_cox_tdc, tdc_full)
+  saveRDS(cox_tdc_full_5, file=filename)
+} else {
+  cox_tdc_full_5 <- readRDS(filename)
+}
+cox_tdc_full_5
+```
+
+```{r Compute time-dependent covariate full Cox model effect sizes}
+filename <- sprintf("%s/cox_tdc_cis_full_5.tsv", table_path)
+if (recompute | !file.exists(filename)) {
+  cox_tdc_cis_full_5 <- tidy(cox_tdc_full_5, conf.int = TRUE, exponentiate = TRUE) %>%
+    drop_na(estimate)    # Some interacting levels don't exist in the date, we drop them here
+  write_tsv(cox_tdc_cis_full_5, file=filename)
+} else {
+  cox_tdc_cis_full_5 <- read_tsv(filename)
+}
+```
+
+
+```{r Plot time-dependent covariate full Cox model effect sizes}
+g <- plot_cis(cox_tdc_cis_full_5, "Time-dependent full Cox model 5 FinnGen") + 
+  labs(x="Hazard ratio") +
+  theme(axis.title.y = element_blank())
+if (save_figs) {
+  filename <- sprintf("%s/cox_tdc_cis_full_5.png", figure_path)
+  ggsave(filename=filename,  plot=g, width = 180,  height = 120, units="mm", dpi=300, scale=1.0, device="png")
+}
+g
+```
+
+Comparison with the old version.
+
+```{r, eval=FALSE}
+filename <- sprintf("%s/old_cox_tdc_cis_full_5.tsv", table_path)
+old_cox_tdc_cis_full_5 <- read_tsv(filename, show_col_types = FALSE)
+cox_comparison <- bind_rows(new = cox_tdc_cis_full_5, old = old_cox_tdc_cis_full_5, .id="model")
+all_variables <- c(non_genetic_variables, genetic_variables)
+g <- cox_comparison %>%
+  mutate(term = fct_relevel(term, all_variables)) %>%
+  plot_cis2("Cox model 5 full FinnGen")
+  
+g <- g + 
+  labs(x="Hazard ratio", y="Variable") +
+  guides(color = guide_legend(reverse = TRUE, override.aes = list(shape = 16)))
+g
+```
+
+## Model 6
+
+Comparison model between FinnGen and UKBB.
+
+### Basic logistic model
+
+```{r}
+variables6 <- c("sex", "age", #"donations_in_five_years", 
+                #"H1_2", # is correlated with C282Y
+                "H63D", "S65C", "C282Y", 
+                "supersnip",
+                "rs3094093", "rs114179634"#, "rs9261354"  # HLA snips
+                #"extra1"
+                )
+f6 <- sprintf("hemochromatosis ~ %s", paste(variables6, collapse=" + "))
+f6
+```
+
+```{r logistic-mod-6}
+logistic_mod_6 <- parsnip::logistic_reg()
+logistic_mod_6
+```
+
+```{r}
+logistic_recipe_6 <- 
+  recipe(as.formula(f6), data = train) %>% 
+  #step_relevel(hemochromatosis, ref_level = "control") %>%
+  step_normalize(age) %>%
+  # step_mutate(C282Y = as.integer(C282Y == 2),     # Encode C282Y and H1-2 as recessive snips
+  #             H1_2  = as.integer(H1_2 == 2)) %>%
+  step_mutate(C282Y = as.factor(C282Y),     # Encode C282Y, H63D and H1-2 as factors
+              H63D  = as.factor(H63D)) %>%
+              #H1_2  = as.factor(H1_2)) %>%
+  step_dummy(all_nominal_predictors(), C282Y, H63D) %>%
+  step_interact(terms = ~ starts_with("C282Y") : c(#starts_with("H1_2"), 
+                                                   starts_with("H63D"), S65C, supersnip, 
+                                                   starts_with("sex")  # donations_in_five_years, sex2_pre, sex2_post
+                                                   #rs3094093, rs114179634,
+                                                   )) %>%
+  step_lincomb(all_numeric_predictors()) # Removes variables that have exact linear combinations with others
+logistic_recipe_6
+```
+
+
+```{r logistic-workflow-6}
+logistic_wflow_6 <- 
+  workflow() %>% 
+  add_model(logistic_mod_6) %>% 
+  add_recipe(logistic_recipe_6)
+logistic_wflow_6
+```
+
+This will fit on training data and show performance measures on test data.
+
+```{r last-fit-6}
+filename <- file.path(model_path, "logistic_lf_6.rds")
+if (! file.exists(filename) || recompute) {
+  logistic_lf_6 <- last_fit(logistic_wflow_6, basic_split)  # Needs to be unfitted workflow
+  saveRDS(logistic_lf_6, filename)
+} else {
+  logistic_lf_6 <- readRDS(filename)
+}
+class(logistic_lf_6)
+```
+
+```{r full-fit-6}
+filename <- file.path(model_path, "logistic_full_6.rds")
+if (! file.exists(filename) || recompute) {
+  logistic_full_6 <- fit(logistic_wflow_6, basic)  # Needs to be unfitted workflow
+  saveRDS(logistic_full_6, filename)
+} else {
+  logistic_full_6 <- readRDS(filename)
+}
+```
+
+
+```{r, eval=FALSE}
+collect_metrics(logistic_lf_6)
+```
+
+Variance inflation factors.
+
+```{r logistic-vif-6}
+logistic_lf_6 %>% extract_workflow() %>% extract_fit_engine() %>% car::vif() %>% sort(decreasing = TRUE)
+```
+
+Calibration.
+
+```{r}
+logistic_lf_6_test_pred <- augment(logistic_lf_6)
+logistic_lf_6_test_pred %>%
+  cal_plot_windowed(truth = hemochromatosis, estimate = .pred_case, step_size = 0.025, event_level="second")
+```
+
+#### Forest plots
+
+```{r logistic-cis-6}
+filename <- file.path(table_path, "logistic_cis_6.tsv")
+if (! file.exists(filename) || recompute) {
+  logistic_cis_6 <- compute_cis(logistic_lf_6 %>% extract_workflow())
+  write_tsv(logistic_cis_6, filename)
+} else {
+  logistic_cis_6 <- read_tsv(filename)
+}
+```
+
+```{r logistic-cis-plot-6}
+#| fig-cap: The age is at first event for cases and at death or EOF for controls.
+filename <- file.path(figure_path, "logistic_cis_6.pdf")
+g <- plot_cis(logistic_cis_6, "Logistic model 6 FinnGen", subtitle=model_stats(logistic_lf_6)) + labs(y="Variable")
+#ggsave(file.path(figure_path, "poster", "logistic_cis_6.pdf"), g + theme(plot.title=element_blank(), axis.title.y.left = element_blank()))
+if (save_figs) 
+  ggsave(filename, g, width=7, height=7)
+g
+```
+
+```{r logistic-cis-full-6}
+filename <- file.path(table_path, "logistic_cis_full_6.tsv")
+if (! file.exists(filename) || recompute) {
+  logistic_cis_full_6 <- compute_cis(logistic_full_6)
+  write_tsv(logistic_cis_full_6, filename)
+} else {
+  logistic_cis_full_6 <- read_tsv(filename)
+}
+```
+
+```{r logistic-cis-full-plot-6}
+#| fig-cap: The age is at first event for cases and at death or EOF for controls.
+filename <- file.path(figure_path, "logistic_cis_full_6.pdf")
+g <- plot_cis(logistic_cis_full_6, "Logistic model 6 full FinnGen", subtitle=model_stats(logistic_full_6)) + labs(y="Variable")
+#g <- plot_cis(logistic_cis_full_6, "Logistic model 6 full FinnGen") + labs(y="Variable")
+if (save_figs)
+  ggsave(filename, g, width=7, height=7)
+g
+```
+
+
+#### Risk table
+
+Compute confidence intervals for predictions for multiple predictor combinations.
+
+```{r}
+# The value of age is stratified by sex
+mean_ages6 <- train %>% group_by(sex) %>% summarise(age = mean(age))
+data6 <- expand_grid(sex = c("male", "female"), H63D=0:2, S65C=0, C282Y=0:2, supersnip=0:2, 
+                    rs3094093=2, rs114179634=0) %>% 
+  mutate(across(sex, as.factor))
+# data6 <- data6 %>% mutate(age = mean(train$age)) # This was a bad idea
+data6 <- data6 %>% inner_join(mean_ages6, by="sex")
+important_predictors6 <- c(Sex="sex", "H63D", "C282Y", HLA3="supersnip") %>% fill_names()
+
+cat("The following variables were fixed during the computation of probabilities\n")
+fixed_predictors6 <- get_fixed_predictors(data6, important_predictors6)
+fixed_predictors6
+```
+
+
+
+```{r, fig.width=12, fig.height=7}
+title <- "Model 6 train data"
+filename <- file.path(table_path, "risk_table_6_train.tsv")
+if (! file.exists(filename) || recompute) {
+  result  <- compute_risk_table(logistic_lf_6, data6, important_predictors6, count_data = train, col="sex", conf.level = 0.95)
+  result2 <- compute_risk_table(logistic_lf_6, data6, important_predictors6, count_data = train, col="sex", conf.level = 0.80)
+  result <- bind_rows(result, result2)
+  write_tsv(result, filename)
+} else {
+  result <- read_tsv(filename, show_col_types = FALSE)
+}
+p <- plot_risk_table(result, important_predictors6, title=title, col = "sex", conf.level = c(0.95, 0.80))
+if (save_figs) {
+  filename <- file.path(figure_path, "risk_table_6_train.pdf")
+  pdf(filename, width=12, height=7, title=title)
+  plot(p[[1]], new_page=TRUE)
+  plot(p[[2]], new_page=FALSE)
+  invisible(dev.off())
+}
+dev.new()
+plot(p[[1]], new_page=TRUE)
+plot(p[[2]], new_page=FALSE)
+```
+
+```{r, fig.width=12, fig.height=7}
+title <- "Model 6 test data"
+filename <- file.path(table_path, "risk_table_6_test.tsv")
+if (! file.exists(filename) || recompute) {
+  result  <- compute_risk_table(logistic_lf_6, data6, important_predictors6, count_data = test, col="sex", conf.level = 0.95)
+  result2 <- compute_risk_table(logistic_lf_6, data6, important_predictors6, count_data = test, col="sex", conf.level = 0.80)
+  result <- bind_rows(result, result2)
+  write_tsv(result, filename)
+} else {
+  result <- read_tsv(filename)
+}
+p <- plot_risk_table(result, important_predictors6, title=title, col = "sex", conf.level = c(0.95, 0.80))
+if (save_figs) {
+  filename <- file.path(figure_path, "risk_table_6_test.pdf")
+  pdf(filename, width=12, height=7, title=title)
+  #plot(p, new_page=TRUE)
+  plot(p[[1]], new_page=TRUE)
+  plot(p[[2]], new_page=FALSE)
+  invisible(dev.off())
+}
+#grid.newpage()
+#png()
+dev.new()
+plot(p[[1]], new_page=TRUE)
+plot(p[[2]], new_page=FALSE)
+#dev.off()
+```
+
+```{r, fig.width=12, fig.height=7}
+title <- "Model 6 full data"
+filename <- file.path(table_path, "risk_table_6_full.tsv")
+if (! file.exists(filename) || recompute) {
+  result  <- compute_risk_table(logistic_full_6, data6, important_predictors6, count_data = basic, col="sex", conf.level = 0.95)
+  result2 <- compute_risk_table(logistic_full_6, data6, important_predictors6, count_data = basic, col="sex", conf.level = 0.80)
+  result <- bind_rows(result, result2)
+  write_tsv(result, filename)
+} else {
+  result <- read_tsv(filename)
+}
+p <- plot_risk_table(result, important_predictors6, title=title, col = "sex", conf.level = c(0.95, 0.80))
+if (save_figs) {
+  filename <- file.path(figure_path, "risk_table_6_full.pdf")
+  pdf(filename, width=12, height=7, title=title)
+  #plot(p, new_page=TRUE)
+  plot(p[[1]], new_page=TRUE)
+  plot(p[[2]], new_page=FALSE)
+  invisible(dev.off())
+}
+#plot(p, new_page=FALSE)
+dev.new()
+plot(p[[1]], new_page=TRUE)
+plot(p[[2]], new_page=FALSE)
+```
+
+Combined effect.
+
+```{r}
+C282Y_plus_HLA3(logistic_cis_full_6)
+```
+
+### Alternative hemochromatosis definition
+
+Dropped S65C because of collinearity.
+
+```{r}
+alternative_variables6 <- c("sex", "age", #"donations_in_five_years", 
+                #"H1_2", # is correlated with C282Y
+                "S65C",
+                "H63D", "C282Y", 
+                "supersnip",
+                "rs3094093", "rs114179634"#, "rs9261354"  # HLA snips
+                #"extra1"
+                )
+alternative_f6 <- sprintf("hemochromatosis ~ %s", paste(alternative_variables6, collapse=" + "))
+alternative_f6
+```
+
+#### Logistic regression
+
+```{r}
+logistic_alternative_mod_6 <- parsnip::logistic_reg()
+logistic_alternative_mod_6
+```
+
+```{r}
+logistic_alternative_recipe_6 <- 
+  recipe(as.formula(alternative_f6), data = train) %>% 
+  #step_relevel(hemochromatosis, ref_level = "control") %>%
+  step_normalize(age) %>%
+  # step_mutate(C282Y = as.integer(C282Y == 2),     # Encode C282Y and H1-2 as recessive snips
+  #             H1_2  = as.integer(H1_2 == 2)) %>%
+  step_mutate(C282Y = as.factor(C282Y),     # Encode C282Y, H63D and H1-2 as factors
+              H63D  = as.factor(H63D)) %>%
+              #H1_2  = as.factor(H1_2)) %>%
+  step_dummy(all_nominal_predictors(), C282Y, H63D) %>%
+  step_interact(terms = ~ starts_with("C282Y") : c(#starts_with("H1_2"), 
+                                                   starts_with("H63D"), supersnip,
+                                                   S65C,
+                                                   starts_with("sex")  # donations_in_five_years, sex2_pre, sex2_post
+                                                   #rs3094093, rs114179634,
+                                                   )) %>%
+  step_lincomb(all_numeric_predictors()) # Removes variables that have exact linear combinations with others
+logistic_alternative_recipe_6
+```
+
+
+```{r}
+logistic_alternative_wflow_6 <- 
+  workflow() %>% 
+  add_model(logistic_alternative_mod_6) %>% 
+  add_recipe(logistic_alternative_recipe_6)
+logistic_alternative_wflow_6
+```
+
+```{r}
+filename <- file.path(model_path, "logistic_alternative_full_6.rds")
+if (! file.exists(filename) || recompute) {
+  logistic_alternative_full_6 <- fit(logistic_alternative_wflow_6, 
+                                 basic2)  # Needs to be unfitted workflow
+  saveRDS(logistic_alternative_full_6, filename)
+} else {
+  logistic_alternative_full_6 <- readRDS(filename)
+}
+s <- logistic_alternative_full_6 %>% extract_fit_engine() %>% summary(correlation = TRUE)
+s
+```
+
+Correlations between coefficients.
+
+```{r}
+s$correlation %>% as_tibble(rownames = "name1") %>% pivot_longer(cols=-name1, names_to="name2") %>% 
+  ggplot(aes(x=name1, y=name2, fill=value)) + 
+  geom_raster() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+rm(s)
+```
+
+Variance inflation factors.
+
+```{r}
+logistic_alternative_full_6 %>% extract_fit_engine() %>% car::vif() %>% sort(decreasing = TRUE)
+```
+
+```{r, eval=FALSE}
+filename <- file.path(table_path, "logistic_cis_alternative_full_6.tsv")
+if (! file.exists(filename) || recompute) {
+  logistic_cis_alternative_full_6 <- compute_cis(logistic_alternative_full_6)
+  write_tsv(logistic_cis_alternative_full_6, filename)
+} else {
+  logistic_cis_alternative_full_6 <- read_tsv(filename)
+}
+```
+
+```{r, eval=FALSE}
+#filename <- file.path(figure_path, "logistic_cis_full_6.pdf")
+g <- logistic_cis_alternative_full_6 %>%
+  # Filter out variables whose confidence intervals were really large
+  filter(! (conf.high > 1e20 | conf.low < 1e-20)) %>%
+  plot_cis("Logistic model 6 alternative full FinnGen", subtitle=model_stats(logistic_alternative_full_6)) + labs(y="Variable")
+if (save_figs) {
+  filename <- file.path(figure_path, "logistic_cis_alternative_full_6.pdf")
+  ggsave(filename, g, width=7, height=7)
+}
+g
+```
+
+#### Firth's logistic regression.
+
+```{r}
+baked <- logistic_alternative_full_6 %>% extract_recipe() %>% bake(new_data = basic2)
+```
+
+```{r}
+filename <- file.path(model_path, "firth_alternative_full_6.rds")
+if (! file.exists(filename) || recompute) {
+  firth_alternative_full_6 <- logistf(formula = hemochromatosis ~ ., data = baked)
+  saveRDS(firth_alternative_full_6, filename)
+} else {
+  firth_alternative_full_6 <- readRDS(filename)
+}
+```
+
+
+
+```{r}
+filename <- file.path(table_path, "firth_cis_alternative_full_6.tsv")
+if (! file.exists(filename) || recompute) {
+  firth_cis_alternative_full_6 <- tidy_firth(firth_alternative_full_6)
+  write_tsv(firth_cis_alternative_full_6, filename)
+} else {
+  firth_cis_alternative_full_6 <- read_tsv(filename)
+}
+```
+
+```{r, eval=FALSE}
+g <- firth_cis_alternative_full_6 %>% 
+  plot_cis("Firth model 6 alternative full FinnGen") + labs(y="Variable")
+if (save_figs) {
+  filename <- file.path(figure_path, "firth_cis_alternative_full_6.pdf")
+  ggsave(filename, g, width=7, height=7)
+}
+g
+```
+
+### Survival
+
+```{r}
+baseline_variables6 <- c("sex", "H63D", "S65C", 
+                        "supersnip",
+                        #credible_snip_names,
+                        "rs3094093", "rs114179634",
+                        "C282Y", 
+                        "C282Y:(H63D + S65C + supersnip + sex)")
+variables6_cox <- c(baseline_variables6)
+f6_cox <- as.formula(sprintf("Surv(event_age, hemochromatosis) ~ %s", paste(variables6_cox, collapse=" + ")))
+f6_cox
+```
+
+```{r}
+cox_train <- train %>% mutate(hemochromatosis = as.integer(hemochromatosis == "case"),
+                              across(c(C282Y, H63D), as.factor))
+cox_full <- basic %>% mutate(hemochromatosis = as.integer(hemochromatosis == "case"),
+                              across(c(C282Y, H63D), as.factor))
+```
+
+#### Kaplan-Meier curves
+
+##### Adjust by C282Y
+
+```{r}
+km_fit <- survival::survfit(Surv(event_age, hemochromatosis) ~ C282Y, data=cox_full)
+km_fit
+```
+
+https://stats.stackexchange.com/questions/402432/why-median-is-na-for-some-of-the-group-outcomes-in-survival-analysis
+
+> If one of the groups has not yet dropped to 50% survival at the end of the available data, you cannot compute a median 
+> survival and there will be NA values for median survival in such cases. Even if median survival has been reached in a group, > it might not be possible to calculate complete confidence intervals for those median values, as you have seen.
+
+What is the survival at age of 90?
+
+```{r}
+tidy(km_fit) %>% filter(time >= 90, strata == "C282Y=2") %>% slice_min(order_by = time, n=1)
+```
+
+```{r}
+#autoplot(km_fit) + labs(x="Age", y="Survival from anemia")
+gsp <- survminer::ggsurvplot(km_fit, #palette = "#2E9FDF", 
+                      conf.int = TRUE, 
+           #fun = "cumhaz",   # cumulative hazards instead of survival
+           fun = NULL,
+           censor = FALSE,
+           risk.table = TRUE, risk.table.y.text.col=TRUE, risk.table.height = 0.3)
+```
+
+
+```{r}
+filename <- file.path(figure_path, "kaplan_meier_C282Y.pdf")
+title <- "Kaplan-Meier C282Y"
+pdf(filename, width=12, height=7, title=title)
+print(gsp, newpage=FALSE)
+invisible(dev.off())
+```
+
+
+```{r}
+#dev.new(noRStudioGD = TRUE)
+grid.newpage()
+print(gsp, newpage = FALSE)
+#invisible(dev.off())
+#gsp
+```
+
+##### Adjust by C282Y and sex
+
+```{r}
+km_fit2 <- survival::survfit(Surv(event_age, hemochromatosis) ~ C282Y + sex, data=cox_full)
+km_fit2
+```
+
+```{r}
+#tidy(km_fit2) %>% filter(time >= 90, strata == "C282Y=2") %>% slice_max(order_by = estimate, n=1)
+km_df2 <- tidy(km_fit2) %>% 
+  separate_wider_delim(cols = strata, delim=",", names=c("C282Y", "sex"))
+filename <- file.path(table_path, "kaplan_meier_C282Y_sex.tsv.gz")
+if (save_tables)
+  write_tsv(km_df2 %>% select(-c(n.risk, n.event, n.censor)), filename)
+km_df2 %>%  
+  filter(time >= 90, C282Y == "C282Y=2") %>%
+  group_by(sex) %>% slice_min(order_by = time, n = 1) %>% ungroup()
+```
+
+
+```{r, fig.width=7, fig.height=5}
+gsp2 <- survminer::ggsurvplot(km_fit2, #palette = "#2E9FDF", 
+                      conf.int = TRUE,
+                      xlab = "Age",
+           #fun = "cumhaz",   # cumulative hazards instead of survival
+           fun = NULL,
+           censor = FALSE,
+           risk.table = TRUE, risk.table.y.text.col=TRUE, risk.table.height = 0.4)
+grid.newpage()
+print(gsp2, newpage = FALSE)
+```
+
+```{r}
+filename <- file.path(figure_path, "kaplan_meier_C282Y_sex.pdf")
+title <- "Kaplan-Meier C282Y, sex"
+pdf(filename, width=12, height=7, title=title)
+print(gsp2, newpage=FALSE)
+invisible(dev.off())
+```
+
+##### Adjust by C282Y/H63D combination
+
+```{r}
+genotype_order <- c("C282Y homozygote", "Compound heterozygote", "H63D homozygote", "Non-carrier")
+tmp <- cox_full %>% mutate(genotype = case_when(
+  C282Y == 2 ~ "C282Y homozygote",
+  H63D == 2  ~ "H63D homozygote",
+  C282Y == 1 & H63D == 1 ~ "Compound heterozygote",
+  TRUE ~ "Non-carrier"
+))
+```
+
+
+```{r}
+km_fit3 <- survival::survfit(Surv(event_age, hemochromatosis) ~ genotype, data=tmp)
+print(km_fit3)
+```
+
+
+```{r}
+km_df3 <- tidy(km_fit3) %>% 
+  mutate(genotype = str_remove(strata, "genotype="))
+  #separate_wider_delim(cols = strata, delim=",", names=c("C282Y", "sex"))
+if (save_tables) {
+  filename <- file.path(table_path, "kaplan_meier_genotype.tsv.gz")
+  write_tsv(km_df3 %>% select(-c(n.risk, n.event, n.censor)), filename)
+}
+# What is the survival at age 90?
+km_df3 %>%  
+  filter(time >= 90) %>%
+  slice_min(order_by = time, n = 1, by = "genotype")
+```
+
+
+```{r}
+gsp3 <- survminer::ggsurvplot(km_fit3, #palette = "#2E9FDF", 
+                      conf.int = TRUE,
+                      xlab = "Age",
+           fun = NULL,
+           censor = FALSE,
+           legend.labs =  genotype_order,
+           break.time.by = 30,
+           risk.table = TRUE, risk.table.y.text.col=TRUE, risk.table.height = 0.4)
+# Save plot to file
+if (save_figs) {
+  filename <- file.path(figure_path, "kaplan_meier_genotype.pdf")
+  title <- "Kaplan-Meier genotype"
+  pdf(filename, width=12, height=7, title=title)
+  print(gsp3, newpage=FALSE)
+  invisible(dev.off())
+}
+# Display plot
+grid.newpage()
+print(gsp3, newpage = FALSE)
+```
+
+
+##### Adjust by C282Y/H63D combination and sex
+
+
+```{r}
+km_fit4 <- survival::survfit(Surv(event_age, hemochromatosis) ~ genotype + sex, data=tmp)
+print(km_fit4)
+```
+
+
+```{r}
+km_df4 <- tidy(km_fit4) %>% 
+  separate_wider_delim(cols = strata, delim=", ", names=c("genotype", "sex")) %>%
+  mutate(genotype = str_remove(genotype, "genotype="),
+         sex = str_trim(str_remove(sex, "sex="))) #%>%
+  #select(genotype, sex)
+if (save_tables) {
+  filename <- file.path(table_path, "kaplan_meier_genotype_sex.tsv.gz")
+  write_tsv(km_df4 %>% select(-c(n.risk, n.event, n.censor)), filename)
+}
+# What is the survival at age 90?
+km_df4 %>%  
+  filter(time >= 90) %>%
+  slice_min(order_by = time, n = 1, by = c("genotype", "sex"))
+```
+
+
+```{r}
+genotype_order2 <- expand_grid(genotype = genotype_order, sex = c("male", "female")) %>% 
+  glue_data("{genotype}, {sex}")
+gsp4 <- survminer::ggsurvplot(km_fit4, #palette = "#2E9FDF", 
+                      conf.int = TRUE,
+                      xlab = "Age",
+           fun = NULL,
+           censor = FALSE,
+           legend.labs =  genotype_order2,
+           break.time.by = 30,
+           risk.table = TRUE, risk.table.y.text.col=TRUE, risk.table.height = 0.4)
+# Save plot to file
+if (save_figs) {
+  filename <- file.path(figure_path, "kaplan_meier_genotype_sex.pdf")
+  title <- "Kaplan-Meier genotype, sex"
+  pdf(filename, width=12, height=7, title=title)
+  print(gsp4, newpage=FALSE)
+  invisible(dev.off())
+}
+# Display plot
+grid.newpage()
+print(gsp4, newpage = FALSE)
+```
+
+
+
+#### Cox regression
+
+```{r}
+filename <- sprintf("%s/cox_fit_6.rds", model_path)
+if (recompute | !file.exists(filename)) {
+  cox_fit_6 <- survival::coxph(f6_cox, data=cox_train)
+  saveRDS(cox_fit_6, file=filename)
+} else {
+  cox_fit_6 <- readRDS(filename)
+}
+summary(cox_fit_6)
+```
+
+```{r}
+filename <- sprintf("%s/cox_full_6.fit", model_path)
+if (recompute | !file.exists(filename)) {
+  cox_full_6 <- survival::coxph(f6_cox, data=cox_full)
+  saveRDS(cox_full_6, file=filename)
+} else {
+  cox_full_6 <- readRDS(filename)
+}
+summary(cox_full_6)
+```
+
+Nothing interesting in this. This is a bit pointless, since the curve is for average of the data.
+
+```{r}
+g <- survminer::ggsurvplot(survfit(cox_fit_6), cox_train, risk.table = TRUE)
+g
+```
+
+
+```{r Compute basic Cox model effect sizes}
+filename <- sprintf("%s/cox_cis_6.tsv", table_path)
+if (recompute | !file.exists(filename)) {
+  cox_cis_6 <- tidy(cox_fit_6, conf.int = TRUE, exponentiate = TRUE) %>%
+    drop_na(estimate)    # Some interacting levels don't exist in the date, we drop them here
+  write_tsv(cox_cis_6, file=filename)
+} else {
+  cox_cis_6 <- read_tsv(filename)
+}
+```
+
+
+```{r Plot basic Cox model effect sizes}
+g <- plot_cis(cox_cis_6, "Cox model 6 FinnGen") +
+  labs(x="Hazard ratio") +
+  theme(axis.title.y = element_blank())
+if (save_figs) {
+  filename <- sprintf("%s/cox_cis_6.png", figure_path)
+  ggsave(filename=filename,  plot=g, width = 180,  height = 120, units="mm", dpi=300, scale=1.0, device="png")
+}
+g
+```
+
+```{r Compute basic full Cox model effect sizes}
+filename <- sprintf("%s/cox_cis_full_6.tsv", table_path)
+if (recompute | !file.exists(filename)) {
+  cox_cis_full_6 <- tidy(cox_full_6, conf.int = TRUE, exponentiate = TRUE) %>%
+    drop_na(estimate)    # Some interacting levels don't exist in the date, we drop them here
+  write_tsv(cox_cis_full_6, file=filename)
+} else {
+  cox_cis_full_6 <- read_tsv(filename)
+}
+```
+
+
+```{r Plot basic full Cox model effect sizes}
+g <- plot_cis(cox_cis_full_6, "Cox model 6 full FinnGen") +
+  labs(x="Hazard ratio") +
+  theme(axis.title.y = element_blank())
+if (save_figs) {
+  filename <- sprintf("%s/cox_cis_full_6.png", figure_path)
+  ggsave(filename=filename,  plot=g, width = 180,  height = 120, units="mm", dpi=300, scale=1.0, device="png")
+}
+g
+```
+
+#### Risk table
+
+```{r}
+data6_surv <- data6 %>% 
+  mutate(across(c(sex, H63D, C282Y), as.factor)) # Convert to same column types as in the data used to fit the model
+```
+
+Predict survival curves for the individuals in the synthetic data.
+
+```{r}
+res <- survfit(cox_fit_6, newdata = data6_surv %>% head(n=10), conf.int = 0.95, 
+        ctype = 2,   # Correct for ties
+        censor = FALSE
+        )
+```
+
+### Same using tidymodels
+
+```{r}
+baseline_variables6t <- c("sex", "H63D", "S65C", 
+                        "supersnip",
+                        "rs3094093", "rs114179634",
+                        "C282Y")
+variables6t_cox <- c(baseline_variables6t)
+f6t_cox <- as.formula(sprintf("s ~ %s", paste(variables6t_cox, collapse=" + ")))
+f6t_cox
+```
+
+```{r}
+cox_mod_6 <- survival_reg() %>% 
+  set_engine("survival") %>% 
+  set_mode("censored regression")
+```
+
+```{r}
+cox_train2 <- cox_train %>% mutate(s = Surv(event_age, hemochromatosis), .keep = "unused")
+```
+
+```{r}
+cox_recipe_6 <- 
+  recipe(as.formula(f6t_cox), data = cox_train2) %>% 
+  #step_normalize(age) %>%
+  step_mutate(C282Y = as.factor(C282Y),     # Encode C282Y, H63D and H1-2 as factors
+              H63D  = as.factor(H63D)) %>%
+  step_dummy(all_nominal_predictors(), C282Y, H63D) %>%
+  step_interact(terms = ~ starts_with("C282Y") : c(
+                                                   starts_with("H63D"), S65C, supersnip, 
+                                                   starts_with("sex")
+                                                   )) %>%
+  step_lincomb(all_numeric_predictors()) # Removes variables that have exact linear combinations with others
+```
+
+```{r}
+cox_wflow_6 <- workflow() %>% 
+  add_recipe(cox_recipe_6) %>% 
+  add_model(cox_mod_6)
+```
+
+```{r}
+cox_fit2_6 <- cox_wflow_6 %>% fit(data = cox_train2)
+cox_fit2_6
+```
+
+Get performance metrics in the train set and using cross-validation.
+
+```{r}
+set.seed(345)
+cox_folds <- vfold_cv(cox_train2, v = number_of_folds)
+cox_metrics <- metric_set(brier_survival_integrated, brier_survival,
+                               roc_auc_survival, concordance_survival)
+evaluation_time_points <- seq(20, 80, 20)
+filename <- file.path(table_path, "cv_metrics.tsv")
+if (! file.exists(filename) || recompute) {
+  resamples <- cox_wflow_6 %>% 
+    fit_resamples(cox_folds, metrics = cox_metrics, eval_time = evaluation_time_points, control = control_resamples(save_pred = TRUE))
+  cv_metrics <- resamples %>% collect_metrics()
+  rm(resamples)
+  write_tsv(cv_metrics, filename)
+} else {
+  cv_metrics <- read_tsv(filename)
+}
+```
+
+```{r}
+filename <- file.path(result_path, "train_preds.rds")
+if (! file.exists(filename) || recompute) {
+  train_preds <- augment(cox_fit2_6, new_data=cox_train2, eval_time = evaluation_time_points)
+  saveRDS(train_preds, filename)
+} else {
+  train_preds <- readRDS(filename)
+}
+train_metrics <- cox_metrics(train_preds, truth = s, estimate = .pred_time, .pred)
+train_metrics
+```
+
+```{r}
+both_metrics <- bind_rows(train=train_metrics, cv=cv_metrics %>% rename(.estimate = mean), .id="method") %>%
+  select(-c(.estimator, n, .config))
+```
+
+```{r}
+both_metrics %>% mutate(name = paste(.metric, coalesce(as.character(.eval_time), ""))) %>%
+  ggplot(aes(.estimate, name, color = method)) + geom_point(position = position_dodge(width=0.3)) +
+  lims(x=0:1)
+```
+
+The brier scores indicate an excellent calibration!
+
+Let's show the ROC curves.
+
+```{r}
+tmp <- train_preds %>% roc_curve_survival(truth = s, .pred)
+tmp %>% autoplot()
+```
+
+## Model 7
+
+This includes all 67 Regenie predicted C282Y-interacting snips.
+
+### XGboost
+
+
+```{r}
+variables7 <- c("sex2", "age", "donations_in_five_years", 
+                "H1_2", # is correlated with C282Y
+                "H63D", "S65C", "C282Y", 
+                "supersnip",
+                credible_snip_names,
+                disease_names,
+                interacting_snip_names,
+                "rs3094093", "rs114179634"#, "rs9261354"  # HLA snips
+                )
+f7 <- sprintf("hemochromatosis ~ %s", paste(variables7, collapse=" + "))
+f7
+```
+
+```{r}
+# These hyperparameters should be optimised!!!!!!!!!!!!!!!!!
+xg_mod_7 <- boost_tree(learn_rate = 0.1, trees = 100) |>
+  set_mode("classification") |> 
+  set_engine("xgboost", verbose = 0)
+```
+
+
+```{r}
+xg_recipe_7 <-
+  recipe(as.formula(f7), data = xg_train) %>% 
+  #step_relevel(hemochromatosis, ref_level = "control") %>%
+  step_normalize(age) %>%
+  step_integer(all_nominal_predictors(), all_of(disease_names), zero_based=TRUE) %>%
+  step_lincomb(all_numeric_predictors()) # Removes variables that have exact linear combinations with others
+xg_recipe_7
+```
+
+From
+https://modeloriented.github.io/shapviz/articles/tidymodels.html
+Remark: Dont use 1:m transforms such as One-Hot-Encodings. They are usually not necessary and make the workflow more complicated. If you cant avoid this, check the collapse argument in shapviz().
+
+```{r xg-workflow-7}
+xg_wflow_7 <- 
+  workflow() %>% 
+  add_model(xg_mod_7) %>% 
+  add_recipe(xg_recipe_7)
+xg_wflow_7
+```
+
+```{r}
+filename <- file.path(model_path, "xg_fit_7.rds")
+if (! file.exists(filename) || recompute) {
+  tic("Fitting XGboost model")
+  xg_fit_7 <- xg_wflow_7 %>% fit(xg_train)
+  saveRDS(xg_fit_7, filename)
+  toc()
+} else {
+  xg_fit_7 <- readRDS(filename)
+}
+class(xg_fit_7)
+```
+
+Took 73 seconds.
+
+```{r}
+xg_fit_7 %>% extract_recipe()
+```
+
+#### SHAP analysis
+
+```{r}
+set.seed(43)
+xg_explain_7 <- xg_train %>% 
+  #head(n=1000) %>% 
+  slice_sample(n=10000) #%>%
+  #mutate(hemochromatosis = fct_relevel(hemochromatosis, c("control", "case")))
+X_pred_7 <- bake(  # goes to xgboost:::predict.xgb.Booster()
+  xg_fit_7 %>% extract_recipe(), 
+  has_role("predictor"),
+  new_data = xg_explain_7,
+  composition = "matrix"
+)
+
+#stopifnot(colnames(X_pred) %in% colnames(xg_explain_5))
+```
+
+Compute the SHAP values.
+
+```{r}
+# Note, the which_class parameter works only for multiclass classification, not for binary classification.
+# shapviz assumes that the first level is the positive class. That cannot be changed, so we have
+# to accept, that the directions of effects are opposite here.
+filename <- file.path(result_path, "shap_values_7.rds")
+if (! file.exists(filename) || recompute) {
+  tic("Computing shap values")
+  set.seed(158)
+  shap_values_7 <- xg_fit_7 %>% extract_fit_engine() %>%
+    shapviz(X_pred = X_pred_7, X = xg_explain_7, which_class=1, interactions = TRUE) #|> 
+  #setNames(levels(iris$Species))
+  toc()
+  saveRDS(shap_values_7, filename)
+} else {
+  shap_values_7 <- readRDS(filename)  
+}
+```
+
+
+
+```{r}
+shap_values_7 %>% 
+  sv_importance() +   # By default this shows only top 15
+  ggtitle("SHAP importance")
+```
+
+Store importances to file.
+
+```{r}
+xg_importance_7 <- shap_values_7 %>% sv_importance(kind="no") %>% enframe()
+if (save_tables) {
+  filename <- file.path(table_path, "xg_importance_7.tsv")
+  write_tsv(xg_importance_7, filename)
+}
+xg_importance_7
+```
+
+```{r}
+shap_values_7 |> 
+  sv_importance(kind = "bee") +
+  ggtitle("SHAP importance")
+```
+
+
+
+```{r}
+xvars <- c("sex2", "age", "donations_in_five_years" , "H63D", "S65C", "C282Y", "supersnip", "credible1", "credible2", "credible3", "rs3094093", "rs114179634", disease_names)
+shap_values_7 |> 
+  sv_dependence(xvars, color_var = NULL) +
+  plot_annotation("SHAP importance")
+  #plot_layout(ncol = 1, guides = "collect")
+```
+
+## Collect performances
+
+### Incidence models
+
+Resample the models.
+
+```{r}
+do_resampling <- function(workflow, folds, id, is_xg=FALSE) {
+  filename <- file.path(model_path, glue("{id}.rds"))
+  event_level <- if (is_xg) "first" else "second"
+  metric_par  <- if (is_xg) mymetrics_rev else mymetrics
+  if (! file.exists(filename) || recompute) {
+    resamples <- 
+      workflow %>% 
+      fit_resamples(folds, metrics = metric_par, control = control_resamples(save_pred = TRUE, event_level=event_level))
+    saveRDS(resamples, filename)
+  } else {
+    resamples <- readRDS(filename)
+  }
+  resamples
+}
+logistic_resamples_0 <- do_resampling(logistic_wflow_0, folds, "logistic_resamples_0")
+logistic_resamples_1 <- do_resampling(logistic_wflow_1, folds, "logistic_resamples_1")
+logistic_resamples_2 <- do_resampling(logistic_wflow_2, folds, "logistic_resamples_2")
+logistic_resamples_3 <- do_resampling(logistic_wflow_3, folds, "logistic_resamples_3")
+logistic_resamples_4 <- do_resampling(logistic_wflow_4, folds, "logistic_resamples_4")
+logistic_resamples_5 <- do_resampling(logistic_wflow_5, folds, "logistic_resamples_5")
+logistic_resamples_6 <- do_resampling(logistic_wflow_6, folds, "logistic_resamples_6")
+xg_resamples_5       <- do_resampling(xg_wflow_5, xg_folds, "xg_resamples_5", is_xg = TRUE)
+xg_resamples_7       <- do_resampling(xg_wflow_7, xg_folds, "xg_resamples_7", is_xg = TRUE)
+```
+
+Extract metrics.
+
+```{r}
+extract_metrics <- function(fit, data=train, xg_data=xg_train) {
+  f <- extract_fit_engine(fit)
+  if ("xgb.Booster" %in% class(f))
+    res <- fit %>% 
+      augment(new_data=xg_data) %>% mymetrics_rev(hemochromatosis, .pred_case, estimate=.pred_class)
+  else
+    res <- fit %>% extract_workflow() %>% 
+      augment(new_data=data)    %>% mymetrics(hemochromatosis, .pred_case, estimate=.pred_class)
+  res %>% select(-.estimator)
+}
+# Put all models and resampled data in a dataframe
+models <- tribble(
+  ~id, ~name, ~model, ~resamples,
+  "logistic_lf_0", "Logistic 0", logistic_lf_0, logistic_resamples_0,
+  "logistic_lf_1", "Logistic 1", logistic_lf_1, logistic_resamples_1,
+  "logistic_lf_2", "Logistic 2", logistic_lf_2, logistic_resamples_2,
+  "logistic_lf_3", "Logistic 3", logistic_lf_3, logistic_resamples_3,
+  "logistic_lf_4", "Logistic 4", logistic_lf_4, logistic_resamples_4,
+  "logistic_lf_5", "Logistic 5", logistic_lf_5, logistic_resamples_5,
+  "logistic_lf_6", "Logistic 6", logistic_lf_6, logistic_resamples_6,
+  "xg_fit_5", "XGBoost 5", xg_fit_5, xg_resamples_5,
+  "xg_fit_7", "XGBoost 7", xg_fit_7, xg_resamples_7
+)
+#tmp <- list(logistic_lf_5 = logistic_resamples_5, xg_fit_5 = xg_resamples_5) %>% enframe("id", "resamples")
+models <- models %>% mutate(train_performances = map(model, extract_metrics))
+models <- models %>% mutate(test_performances = map(model, function(m) extract_metrics(m, test, xg_test)))
+models <- models %>% mutate(cv_performances = map(resamples, ~ if (!is.null(.)) collect_metrics(.)))
+train_performances <- models %>% select(id, name, train_performances) %>% unnest(train_performances)
+test_performances <- models %>% select(id, name, test_performances) %>% unnest(test_performances)
+cv_performances <- models %>% select(id, name, cv_performances) %>% unnest(cv_performances) %>% 
+  mutate(.estimate = mean,
+         low  = .estimate - 1.96 * std_err,    # Create 95% confidence intervals from standard error
+         high = .estimate + 1.96 * std_err)
+#bind_rows(xg=xg_perf1, logistic=logistic_perf1, .id = "model") %>% pivot_wider(names_from=model, values_from=.estimate) %>% select(-.estimator)
+```
+
+#### Areas under the curves
+
+```{r}
+method_order <- c("train", "cv", "test")
+df <- 
+  bind_rows(
+    train=train_performances,
+    test=test_performances,
+    cv=cv_performances, .id = "method"
+  ) %>% 
+  filter(.metric %in% c("accuracy", "ppv", "roc_auc", "pr_auc", "brier_class")) %>%
+  mutate(method = factor(method, method_order))
+if (save_tables) {
+  tsv_filename <- sprintf("%s/all_performances.tsv", table_path)
+  write_tsv(df, tsv_filename)
+}
+g <- df %>%
+  drop_na(.estimate) %>%
+  mutate(across(c(name, method), fct_rev))  %>%
+  ggplot(aes(x=.estimate, y=name, color=method, xmin=low, xmax=high)) + 
+  geom_linerange(position = position_dodge(width=0.5), na.rm=TRUE) + 
+  geom_point(position = position_dodge(width=0.5)) + 
+  scale_color_discrete(breaks = method_order) +
+  facet_wrap(~.metric) +
+  labs(x="Estimate", y="Model", color="Method", title="Performances", subtitle="With standard errors") +
+  lims(x=0:1)
+if (save_figs) {
+  filename <- sprintf("%s/all_performances.pdf", figure_path)
+  ggsave(filename=filename,  plot=g, width = 180,  height = 120, units="mm", dpi=300, scale=1.0, device="pdf", title="All performances")
+}
+g
+```
+
+In some folds the ppvs are NA. This happens when the model predicts no individuals as hemochromatosis cases.
+
+```{r}
+models %>% pluck("resamples", 1) %>% collect_metrics(summarize=FALSE) %>% filter(.metric == "ppv")
+```
+
+```{r}
+models %>% pluck("resamples", 1) %>% collect_predictions(summarize=FALSE) %>% mutate(id = as.factor(id)) %>% summary()
+```
+
+This tells more about problems with CV when there are so few cases. Maybe I should decrease the number of folds.
+
+
+Testing:
+
+```{r, eval=FALSE}
+mymetrics1 <- metric_set(brier_class)
+mymetrics2 <- metric_set(yardstick::metric_tweak("brier_class", brier_class, event_level = "second"))
+mymetrics3 <- metric_set(yardstick::metric_tweak("brier_class", brier_class, event_level = "first"))
+res <- logistic_lf_0 %>% extract_workflow() %>% 
+      augment(new_data=train)
+bind_rows(
+  res %>% mymetrics1(hemochromatosis, .pred_case, estimate=.pred_class),
+  res %>% mymetrics2(hemochromatosis, .pred_case, estimate=.pred_class),
+  res %>% mymetrics3(hemochromatosis, .pred_case, estimate=.pred_class)
+)
+brier_class(res, hemochromatosis, .pred_case)
+brier_class(res, hemochromatosis, .pred_control)
+```
+
+#### Curves 
+
+Let's show the roc and pr curves for these models.
+
+Extract predictions.
+
+```{r}
+helper_train <- function(id, m) extract_predictions(m, new_data = if (id %in% c("xg_fit_5", "xg_fit_7")) xg_train else train)
+helper_test  <- function(id, m) extract_predictions(m, new_data = if (id %in% c("xg_fit_5", "xg_fit_7")) xg_test  else test)
+
+models <- models %>% 
+  mutate(cv_predictions = map(resamples, extract_predictions),
+         train_predictions = map2(id, model, helper_train),
+         test_predictions  = map2(id, model, helper_test),)
+
+pred_cv <- models %>% select(id2=id, name, cv_predictions) %>% unnest(cv_predictions) %>%
+  mutate(event_level = if_else(id2 %in% c("xg_fit_5", "xg_fit_7") , "first", "second"))
+pred_train <- models %>% select(id2=id, name, train_predictions) %>% unnest(train_predictions) %>%
+  mutate(event_level = if_else(id2 %in% c("xg_fit_5", "xg_fit_7"), "first", "second")) %>%
+  select(c("id2", "name", ".pred_class", ".pred_control", ".pred_case",  "id", ".row", "hemochromatosis", ".config"))
+pred_test  <- models %>% select(id2=id, name, test_predictions) %>% unnest(test_predictions) %>%
+  mutate(event_level = if_else(id2 %in% c("xg_fit_5", "xg_fit_7"), "first", "second")) %>%
+  select(c("id2", "name", ".pred_class", ".pred_control", ".pred_case",  "id", ".row", "hemochromatosis", ".config"))
+
+event_level <- "second"
+```
+
+Compute cross-validation curves.
+
+```{r}
+roc_cv <- pred_cv %>%
+  group_by(id2, name) %>% 
+  roc_curve(hemochromatosis, .pred_case, event_level = event_level) %>% 
+  ungroup()
+pr_cv <- pred_cv %>%
+  group_by(id2, name) %>% 
+  pr_curve(hemochromatosis, .pred_case, event_level = event_level) %>% 
+  ungroup()
+```
+
+Compute train curves.
+
+```{r}
+roc_train <- pred_train %>%
+  group_by(id2, name) %>% 
+  roc_curve(hemochromatosis, .pred_case, event_level = event_level) %>% 
+  ungroup()
+pr_train <- pred_train %>%
+  group_by(id2, name) %>% 
+  pr_curve(hemochromatosis, .pred_case, event_level = event_level) %>% 
+  ungroup()
+```
+
+Compute test curves.
+
+```{r}
+roc_test <- pred_test %>%
+  group_by(id2, name) %>% 
+  roc_curve(hemochromatosis, .pred_case, event_level = event_level) %>% 
+  ungroup()
+pr_test <- pred_test %>%
+  group_by(id2, name) %>% 
+  pr_curve(hemochromatosis, .pred_case, event_level = event_level) %>% 
+  ungroup()
+```
+
+```{r}
+roc_data <- bind_rows(cv=roc_cv, train=roc_train, test=roc_test, .id="method")
+if (save_tables) {
+  filename <- file.path(table_path, "roc_data.tsv.gz")
+  write_tsv(roc_data, filename)
+}
+g <- roc_data %>% 
+  ggplot(aes(1-specificity, sensitivity, group=name, color=name)) + geom_line() +
+  facet_wrap(~method) + labs(title="ROC")
+if (save_figs) {
+  filename <- sprintf("%s/all_roc_curves.pdf", figure_path)
+  ggsave(filename=filename,  plot=g, width = 180,  height = 120, units="mm", dpi=300, scale=1.0, device="pdf")
+}
+g
+```
+
+```{r}
+pr_data <- bind_rows(cv=pr_cv, train=pr_train, test=pr_test, .id="method")
+if (save_tables) {
+  filename <- file.path(table_path, "pr_data.tsv.gz")
+  write_tsv(pr_data, filename)
+}
+g <- pr_data %>% 
+  ggplot(aes(recall, precision, group=name, color=name)) + geom_line() +
+  facet_wrap(~method) + labs(title="PR")
+if (save_figs) {
+  filename <- sprintf("%s/all_pr_curves.pdf", figure_path)
+  ggsave(filename=filename,  plot=g, width = 180,  height = 120, units="mm", dpi=300, scale=1.0, device="pdf")
+}
+g
+```
+
+### Model formulas
+
+```{r}
+# The extra braces below are needed to make . work correctly in the pipeline. See
+# https://stackoverflow.com/questions/42385010/using-the-pipe-and-dot-notation
+models %>%
+  head(n = -2) %>%   # Doesn't work for xgboost models
+  {
+  walk2(.$name, .$model, 
+        function(name, model) {
+          cat(name, ":\n", sep="")
+          model %>% extract_fit_engine() %>% formula() %>% deparse1() %>% cat("\n")
+        }
+  )
+  }
+```
+
+```{r}
+cat("XGBoost 5:\n")
+cat(f5, "\n")
+cat("XGBoost 7:\n")
+cat(f7)
+```
+
+## Extract information
+
+```{r}
+df <- read_tsv(file.path(model_path, "models.tsv"))
+df <- df %>% 
+  filter(type %in% c("cox", "logistic")) %>% 
+  filter(filename != "cox_full_6.rds") %>% # What's wrong with this? It does not exist!
+  #filter(type %in% c("xg", "rf")) %>%    # There's not much information in these
+  mutate(model = map(filename, function(f) readRDS(file.path(result_path, "models", f))))
+```
+
+```{r}
+filename <- file.path(table_path, "model_info.tsv")
+if (recompute || ! file.exists(filename)) {
+  model_info <- df %>% mutate(tmp = map(model, model_stats2)) %>% unnest(tmp) %>% select(-model)
+  write_tsv(model_info, filename)
+} else {
+  model_info <- read_tsv(filename)
+}
+model_info
+```
+
+Since the train data was fitted on the split data with final_fit(), and full data was
+fitted on full data with fit(), the returned object types are different. Hence, below I have
+to first called extract_fit_engine() before glance.
+
+```{r}
+filename <- file.path(table_path, "glance_logistic.tsv")
+if (recompute || ! file.exists(filename)) {
+  glance_logistic <- df %>% 
+    filter(type == "logistic") %>% # head(2) %>% 
+    mutate(tmp = map(model, function(f) glance(extract_fit_engine(f)))) %>% 
+    unnest(tmp) %>%
+    select(-model)
+  write_tsv(glance_logistic, filename)
+} else {
+  glance_logistic <- read_tsv(filename)
+}
+glance_logistic
+```
+
+Because some Cox models are time-dependent covariate models, the n variable does not make much sense
+for them.
+
+```{r}
+filename <- file.path(table_path, "glance_cox.tsv")
+if (recompute || ! file.exists(filename)) {
+  glance_cox <- df %>% filter(type == "cox") %>% mutate(tmp = map(model, glance)) %>% unnest(tmp) %>% select(-model)
+  write_tsv(glance_cox, filename)
+} else {
+  glance_cox <- read_tsv(filename)
+}
+glance_cox
+```
+
+
+
+The concordance seems to be slightly better in the tdc model.
+
+
+
+
+
+

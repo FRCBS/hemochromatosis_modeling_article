@@ -1,0 +1,1270 @@
+---
+title: "Hemochromatosis model in UKBB"
+author: "Jarkko Toivonen"
+date: "`r Sys.Date()`"
+format: 
+  html:
+    df-print: kable
+    toc: true
+    toc-depth: 4
+    embed-resources: true
+---
+
+## Setup
+
+```{r, eval=FALSE}
+install.packages("probably")
+install.packages("biomaRt")
+install.packages("ggh4x")
+renv::snapshot()
+```
+
+```{r setup}
+library(tidyverse)
+library(tidymodels)
+library(glue)
+library(glmnet)
+library(broom)
+library(fmsb)  # for NagelkerkeR2
+library(survival)
+library(ciTools)
+library(forestplot)
+library(tableone)
+library(probably)  # for calibration plots
+library(statmod)   # for quantile residuals
+library(patchwork)
+library(splines)
+library(survminer)
+
+#ukbb_dir <- "/media/ukbb/UKBB"
+qctool <- "~/bin/qctool"
+bgenix <- "~ubuntu/progs/bgen/bin/bgenix"
+result_path <- "../results"
+figure_path <- file.path(result_path, "figures")
+table_path <- file.path(result_path, "tables")
+
+recompute <- FALSE
+recompute_genotypes <- FALSE
+save_figs <- FALSE
+save_tables <- FALSE
+
+#boot.n <- 2000  # Not needed
+```
+
+## Functions
+
+```{r}
+pretty_conv2 <- tibble::tribble(
+     ~phenocode,    ~phenotype,
+          "age",         "Event age",
+     "assessment_age", "Baseline age",
+     "event_age", "Diagnosis age",
+     "hemochromatosis", "Hemochromatosis",
+          "sex_female",         "Female",
+          "sexfemale",         "Female",
+     "sex", "Sex",
+     "rs181949568", "Causal1 (rs181949568)",
+  "rs114179634", "HLA1 (rs114179634)",
+    "rs3094093",   "HLA2 (rs3094093)",
+    "supersnip",   "HLA3 (rs9272324)",
+         "H1_2",        "H1_2",
+         "H63D",        "H63D",
+         "S65C",        "S65C",
+        "C282Y",       "C282Y",
+        "C282Y_X1",       "C282Y heterozygote",
+        "C282Y_X2",       "C282Y homozygote",
+        "C282Y1",       "C282Y heterozygote",
+        "C282Y2",       "C282Y homozygote",
+         "H63D_X1",        "H63D heterozygote",
+         "H63D_X2",        "H63D homozygote",
+         "H63D1",        "H63D heterozygote",
+         "H63D2",        "H63D homozygote",
+         "H1_2_X1",        "H1-2 heterozygote",
+         "H1_2_X2",        "H1-2 homozygote",
+  ) %>% deframe()
+# Form pretty interaction names
+create_interactions <- function(x, y, input_sep="_x_", output_sep=" x ") {
+  interactions <- bind_rows(   # Make interactions in both ways
+    expand_grid(a=x, b=y),
+    expand_grid(a=y, b=x)
+  )
+  interactions %>% 
+    mutate(interaction = paste(a, b, sep=input_sep), pretty=paste(pretty_conv2[a], pretty_conv2[b], sep=output_sep)) %>% 
+    select(interaction, pretty) %>%
+    deframe()
+}
+# Tidymodels encoding
+interactions1 <- create_interactions(c("C282Y_X1", "C282Y_X2"),
+                                    c("H63D_X1", "H63D_X2", "S65C", "supersnip",
+                                      "sex_female", "rs114179634", "rs3094093"),
+                                    input_sep = "_x_",
+                                    output_sep = " x ")
+# Base R encoding
+interactions2 <- create_interactions(c("C282Y1", "C282Y2"),
+                                    c("H63D1", "H63D2", "S65C", "supersnip",
+                                      "sexfemale", "rs114179634", "rs3094093"),
+                                    input_sep = ":",
+                                    output_sep = " x ")
+pretty_conv <- c(pretty_conv2, interactions1, interactions2)
+```
+
+```{r}
+model_stats <- function(fit) {
+  #y <- fit[["fit"]][["fit"]][["fit"]][["data"]] %>% pull(..y) 
+  y <- extract_fit_engine(fit)[["data"]] %>% pull(..y) 
+  
+  res <- fit %>% extract_fit_engine() %>% fmsb::NagelkerkeR2()
+  sprintf("N=%i, prevalence=%.2f%%, R2=%.2f", res$N, mean(y == "case")*100, res$R2)
+}
+```
+
+```{r}
+compute_cis <- function(model) {
+  cis <- model %>%
+    tidy(conf.int = TRUE, exponentiate = TRUE) %>%
+    filter(term != "(Intercept)")
+  cis
+}
+```
+
+```{r}
+plot_cis <- function(cis, title, subtitle=NULL) {
+  cis %>%
+    mutate(term = fct_relevel(term, intersect(names(pretty_conv), term)),
+           term = fct_relabel(term, ~ coalesce(pretty_conv[.x], .x)),
+           term = fct_rev(term),
+           hollow_color = if_else(conf.low < 1 & conf.high > 1, NA, "black")) %>%
+    ggplot(aes(x=estimate, xmin=conf.low, xmax=conf.high, y=term, fill=I(hollow_color))) +
+    geom_vline(xintercept = 1, color="gray") +
+    geom_linerange() +
+    geom_point(shape=21, size=3) +
+    scale_fill_identity() +
+    scale_x_log10() +
+    #scale_fill_discrete(na.value = NA, guide="none") +
+    labs(title=title, subtitle=subtitle, x="Odds ratio", y="Variable")
+}
+```
+
+```{r}
+fill_names <- function(v) {
+  old_names <- names(v) %>% na_if("")
+  new_names <- coalesce(old_names, unname(v))
+  set_names(v, new_names)
+}
+swap_names_and_values <- function(v) {
+  set_names(names(v), unname(v))
+}
+```
+
+```{r}
+is_wholenumber <- function(x, tol = .Machine$double.eps^0.5) abs(x - round(x)) < tol
+get_fixed_predictors <- function(data, important_predictors) {
+  helper2 <- function(value) {
+    if (is.factor(value) || is_wholenumber(value) || is.logical(value)) as.character(value) else sprintf('%.2f', value)
+  }
+  helper <- function (value, name) {
+    glue("{name}={map(value, helper2)}")
+  }
+  data %>%
+    select(-all_of(important_predictors)) %>%
+    distinct() %>%
+    as.list() %>%
+    imap(helper) %>%
+    paste(collapse=" ")
+}
+```
+
+```{r}
+risk_table <- function(lf, data, important_predictors, filename, title=NULL, n=16) {
+  variables <- important_predictors %>% unname()
+  fit <- lf %>% extract_fit_engine()
+  prediction_cis <- lf %>%
+    extract_recipe() %>%
+    bake(data) %>%
+    ciTools::add_ci(fit, names = c("lower", "upper"), yhatName = "mean", alpha = 0.5) %>%
+    mutate(type = "parametric")
+  tmp <- bind_cols(data %>% select(all_of(variables)),
+                   prediction_cis %>% select(mean, lower, upper))
+  counts <- train %>% count(across(all_of(variables)))
+  result <- tmp %>%
+    left_join(counts, by=variables) %>%
+    replace_na(list(n=0)) %>%
+    filter(n >= 5) %>%
+    arrange(desc(mean))
+  if (save_figs) {
+    pdf(filename, width=12, height=7, title=basename(filename))
+  }
+  result2 <- result %>%
+    slice_max(order_by = mean, n=n) %>%
+    mutate(probability = sprintf("%.3f", mean))
+  important_predictors2 <- c(important_predictors,
+                             Probability="probability", `Train count`="n")
+  variables <- important_predictors2 %>% unname()
+  header <- important_predictors2 %>% swap_names_and_values()
+  rlang::inject(
+    p <- result2 %>%
+      forestplot(labeltext = !!variables,
+                 boxsize = 0.2,
+                 title = title,
+                 new_page = FALSE,
+                 xlab = "Hemochromatosis probability") %>%
+      fp_add_lines() %>%
+      fp_add_header(!!!header) %>%
+      fp_set_zebra_style("#EFEFEF")
+  )
+  print(p)
+  if (save_figs) dev.off()
+  p
+}
+```
+
+```{r}
+compute_risk_cis <- function(lf, newdata, important_predictors, count_data = train, conf.level = 0.95) {
+  variables <- important_predictors %>% unname()
+  fit <- lf %>% extract_fit_engine()
+  prediction_cis <- lf %>% 
+    extract_recipe() %>%
+    bake(newdata) %>% 
+    ciTools::add_ci(fit, names = c("lower", "upper"), yhatName = "mean", alpha = 1 - conf.level) %>%
+    mutate(type = "parametric")
+  counts <- count_data %>% count(across(all_of(variables)))
+  result <-
+    bind_cols(
+      newdata %>% select(all_of(variables)),
+      prediction_cis %>% select(mean, lower, upper)) %>%
+    left_join(counts, by=variables) %>%
+    replace_na(list(n=0))
+  result
+}
+
+compute_risk_table <- function(model, newdata, important_predictors ,count_data, col="sex2", conf.level = 0.95) {
+  cis <- compute_risk_cis(model, newdata, important_predictors, count_data = count_data, conf.level = conf.level)
+  tmp_variables <- setdiff(unname(important_predictors), c("sex2", "sex", "donation_in_five_years"))
+  tmp2 <- cis %>% 
+    group_by(across(all_of(tmp_variables))) %>%
+    mutate(max_mean = max(mean), max_n = max(n)) %>%
+    group_by(max_mean, max_n, .add=TRUE) %>% nest() %>% ungroup() %>%
+    filter(max_n >= 10) %>%
+    slice_max(order_by=max_mean, n=8) %>%
+    unnest(data)
+  if (col == "sex") {
+    tmp2 <- tmp2 %>%
+      mutate(value = sprintf("%.3f (%i)", mean, n))
+  } else {
+      tmp2 <- tmp2 %>%
+        mutate(value = sprintf("%.3f (%s)", mean, if_else(donations_in_five_years == 0, as.character(n), "NA")))
+  }
+  labels <- tmp2 %>%
+    select(-c(max_mean, max_n, mean, lower, upper, n)) %>%
+    pivot_wider(names_from=starts_with("sex"), values_from=value)
+  
+  if (col == "sex2") {
+    result <- tmp2 %>% inner_join(labels, by=setdiff(unname(important_predictors), c("sex2", "sex")))
+  } else {
+    result <- tmp2 %>% inner_join(labels, by=setdiff(unname(important_predictors), c("sex2", "sex", "donations_in_five_years")))
+  }
+  result %>% mutate(conf.level = conf.level)
+  
+}
+
+```
+
+```{r}
+plot_risk_table <- function(result, important_predictors, title = NULL, col="sex2", conf.level) 
+{
+  max_x <- result %>% pull(upper) %>% max()
+  max_x <- as.integer(max_x/0.05 + 1)*0.05
+  if (col == "sex2") {
+    important_predictors2 <- c(important_predictors, Male="male", Pre="pre", Post="post") %>%
+      discard_at("Sex2")
+    colors <- c("blue", "darkred", "green")
+    stripes <- c("#ffffff", "#efefef", "#dfdfdf")
+  } else {
+    important_predictors2 <- c(important_predictors, Male="male", Female="female") %>%
+      discard_at("Sex")
+    colors <- c("blue", "darkred")
+    stripes <- c("#ffffff",  "#dfdfdf")
+  }
+  variables <- important_predictors2 %>% unname()
+  header <- important_predictors2 %>% swap_names_and_values()
+  colgap <- convertX(unit(6, "mm"), "npc")
+  xlab <- "Hemochromatosis probability"
+  xticks <- seq(0, max_x, 0.05)
+  confidence_line_color <- "black"
+  txt_gp <- fpTxtGp(xlab = gpar(cex = 0.7),
+                    ticks = gpar(cex = 0.6)
+                    )
+  txt_gp2 <- fpTxtGp(
+      xlab = gpar(
+        cex = 0.7,
+        alpha = 0
+      ),
+      label = gpar(alpha = 0),
+      legend = gpar(alpha = 0),
+      ticks = gpar(alpha = 0, cex = 0.6)
+      )
+  boxsize <- 0.2
+  rlang::inject(
+    p1 <- result %>%
+      filter(conf.level == .env$conf.level[[1]]) %>%
+      group_by(across(all_of(col))) %>%
+      forestplot(labeltext=!!variables,
+                 title = title,
+                 new_page = FALSE,
+                 colgap = colgap,
+                 xlab = xlab,
+                 xticks = xticks,
+                 txt_gp = txt_gp,
+                 col = fpColors(lines = confidence_line_color),
+                 lwd.ci = 1.5,
+                 boxsize = boxsize) %>%
+      fp_set_style(box = colors |> lapply(function(x) gpar(fill = x, col = "#555555")),
+                   default = gpar(lineend = "square", vertices = TRUE)) %>%
+      fp_add_header(!!!header) %>%
+      fp_set_zebra_style(!!!stripes)
+  )
+  
+  rlang::inject(
+    p2 <- result %>%
+      filter(conf.level == .env$conf.level[[2]]) %>%
+      group_by(across(all_of(col))) %>%
+      forestplot(labeltext=!!variables,
+                 title = "",
+                 new_page = FALSE,
+                 colgap = colgap,
+                 zero = NA,
+                 xlab = " ",
+                 xticks = xticks,
+                 txt_gp = txt_gp2,
+                 col = fpColors(zero = NA, lines = confidence_line_color),
+                 lwd.ci = 6,
+                 boxsize = boxsize) %>%
+      fp_set_style(box = colors |> lapply(function(x) gpar(fill = x, col = "#555555")),
+                   default = gpar(lineend = "square", vertices = TRUE)) %>%
+      fp_add_header(!!!header) #%>%
+      #fp_set_zebra_style(!!!stripes)
+  )
+  list(p1, p2)
+}
+```
+
+## Load data
+
+```{r}
+basic <- readRDS("../results/basic.rds")
+```
+
+### Withdrawals
+
+Get withdrawals.
+
+```{r, eval=FALSE}
+# This file was last changed 2023-09-11
+filename <- file.path(ukbb_dir, "data/withdrawals/all_withdrawals.csv")
+withdrawals <- read_tsv(filename, col_names = FALSE) %>% pull(X1)
+length(withdrawals)
+```
+
+
+
+
+
+
+
+
+
+
+
+Only one credible snip was found and only 50 persons are heterozygotes.
+
+## Form data
+
+```{r}
+filename <- "../results/basic_combined.rds"
+if (!file.exists(filename) || recompute) {
+  basic_combined <- basic %>%
+    rename(H1_2="H1-2") %>%
+    mutate(age = eof_age) %>%
+    mutate(sex = factor(sex, levels=c("male", "female")),
+           sex2 = factor(case_when(sex == "male" ~ "male",
+                                   age <= 50 ~ "pre",
+                                   age > 50  ~ "post"),
+                         levels=c("male", "pre", "post")))
+  saveRDS(basic_combined, filename)
+} else {
+  basic_combined <- readRDS(filename)
+}
+basic_combined <- basic_combined %>%
+  mutate(survival_age = coalesce(event_age, eof_age))   # This is for the survival model
+```
+
+## Table 1
+
+Create table 1.
+
+```{r}
+genetic_variables <- c("C282Y", "H63D", "S65C",
+                
+                "rs181949568",
+                "H1_2",
+                "rs114179634", "rs3094093", "supersnip")
+
+vars <- c("hemochromatosis", "sex", "assessment_age", "event_age",
+          genetic_variables)
+renamer <- function(x) { coalesce(pretty_conv[x], x) %>% unname()}
+#basic_combined <- basic_combined %>% rename(rs181949568 = credible1) # Korjaa tämä eksploraatiossa!!!!!
+tmp <- basic_combined %>%
+  mutate(across(c("rs181949568", "rs114179634"), function(v) { v %>% round()}),
+         across("rs181949568", function(v) { v %>% as.factor() %>% fct_collapse(dominant = c("1", "2")) } ),
+         hemochromatosis = fct_relevel(hemochromatosis, c("control", "case"))) %>%
+  rename_with(renamer)
+```
+
+```{r}
+continuous_variables <- c("Baseline age", "Diagnosis age")
+tmp %>% 
+  select(eid, Sex, all_of(continuous_variables)) %>% 
+  pivot_longer(cols = all_of(continuous_variables)) %>%
+  ggplot(aes(value)) +
+  geom_histogram() +
+  ggh4x::facet_grid2(Sex ~ name, scales = "free", independent = TRUE)
+```
+
+```{r}
+tableone <- tableone::CreateTableOne(vars = vars %>% map_chr(renamer), 
+                                     strata = "Sex", data = tmp,
+                           factorVars = c("Hemochromatosis", genetic_variables) %>% map_chr(renamer),
+                           addOverall = TRUE)
+#rm(tmp)
+# Save to a TSV file
+if (save_tables) {
+  filename <- file.path(table_path, "tableone_ukbb.tsv")
+  tableone_matrix <- print(tableone, quote=FALSE, noSpaces = TRUE, printToggle = FALSE,
+                           nonnormal = continuous_variables)
+  write_tsv(tableone_matrix %>% as_tibble(rownames = "rownames"), file = filename)
+}
+print(tableone, nonnormal = continuous_variables)
+```
+
+```{r}
+tmp %>% select(all_of(continuous_variables)) %>% summary()
+```
+
+How many non-NA values?
+
+```{r}
+tmp %>% select(all_of(continuous_variables)) %>% summarise(across(everything(), function(v) sum(!is.na(v))))
+```
+
+## Split
+
+Divide the data into train and test sets.
+
+```{r}
+seed <- 142
+set.seed(seed)
+helper <- function(n) {
+  v <- rep(c("train", "test"), length.out=n)
+  sample(v, n)
+}
+use_tidymodels <- TRUE
+if (use_tidymodels) {
+  # See
+  # https://github.com/tidymodels/rsample/issues/473
+  basic_split <- basic_combined %>%
+    initial_split(strata = "hemochromatosis", prop = 0.5) #, pool = 0.0010) # causes bias
+  # set.seed(seed)
+  # basic_split_wild <- basic_combined %>%
+  #   filter(C282Y == 0) %>%
+  #   initial_split(strata = "hemochromatosis", prop = 0.5, pool = 0.0010)
+  train <- training(basic_split)
+  test <- testing(basic_split)
+  # train_wild <- training(basic_split_wild)
+  # test_wild <- testing(basic_split_wild)
+} else {
+  tmp <- basic %>%
+    group_by(hemochromatosis, sex) %>%
+    mutate(group = helper(n())) %>%
+    ungroup()
+    
+  train <- tmp %>% filter(group=="train") %>% select(-group)
+  test <- tmp %>% filter(group=="test") %>% select(-group)
+  rm(tmp)
+}
+```
+
+
+## Logistic model 1
+
+
+
+
+```{r}
+known_snip_names <- c("H1_2",  "H63D",  "S65C", "C282Y", "supersnip")
+hla_snip_names <- c("rs114179634",  #"rs9261354",  
+                    "rs3094093")
+credible_snip_names <- c("rs181949568",  "rs1284018747", "rs1300021441")
+hla_snip_names2 <- intersect(colnames(basic_combined), hla_snip_names)
+#credible_snip_names2 <- setdiff(colnames(credible_snips), "eid")
+credible_snip_names2 <- intersect(colnames(basic_combined), credible_snip_names)
+variables1 <- c("sex", "age",  "H1_2",  "H63D", "S65C", "C282Y", 
+                # "H63D:C282Y", # Done in the recipe 
+                "supersnip", "rs3094093", "rs114179634")
+                #credible_snip_names2)
+f1 <- sprintf("hemochromatosis ~ sex + age + %s",
+             paste(variables1, collapse = " + "))
+f1
+```
+
+```{r}
+logistic_mod_1 <- parsnip::logistic_reg()
+logistic_mod_1
+```
+
+```{r}
+logistic_recipe_1 <-
+  recipe(as.formula(f1), data=train) %>%
+  #step_relevel(hemochromatosis, ref_level = "control") %>%
+  step_normalize(age) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_interact(terms = ~ H63D:C282Y)
+logistic_recipe_1
+```
+
+```{r}
+logistic_wflow_1 <-
+  workflow() %>%
+  add_model(logistic_mod_1) %>%
+  add_recipe(logistic_recipe_1)
+logistic_wflow_1
+```
+
+```{r}
+filename <- file.path(result_path, "logistic_lf_1.rds")
+if (! file.exists(filename) || recompute) {
+  logistic_fit_1 <- logistic_wflow_1 %>%
+    fit(data = train)
+  saveRDS(logistic_fit_1, filename)
+} else {
+  logistic_fit_1 <- readRDS(filename)
+}
+logistic_fit_1
+```
+
+
+
+```{r}
+broom::glance(logistic_fit_1)
+```
+
+Variance inflation factors.
+
+```{r}
+logistic_fit_1 %>% extract_fit_engine() %>% car::vif() %>% sort(decreasing = TRUE)
+```
+
+```{r}
+logistic_fit_1 %>% extract_fit_engine() %>% plot()
+```
+
+```{r}
+logistic_fit_1 %>% extract_fit_engine() %>% fmsb::NagelkerkeR2()
+```
+
+```{r}
+filename <- file.path(table_path, "logistic_cis_1.tsv")
+if (! file.exists(filename) || recompute) {
+  logistic_cis_1 <- compute_cis(logistic_fit_1)
+  write_tsv(logistic_cis_1, filename)
+} else
+  logistic_cis_1 <- read_tsv(filename)
+```
+
+
+
+
+```{r}
+filename <- file.path(figure_path, "logistic_cis_1.pdf")
+g <- plot_cis(logistic_cis_1, "Logistic model 1", subtitle=model_stats(logistic_fit_1))
+ggsave(filename, g)
+g
+```
+
+Calibration.
+
+```{r}
+logistic_fit_1_test_pred <- augment(logistic_fit_1, new_data = test)
+logistic_fit_1_test_pred %>%
+  cal_plot_windowed(truth = hemochromatosis, estimate = .pred_case, step_size = 0.025, event_level = "second")
+```
+
+Try with quantile residuals instead.
+
+```{r}
+constant_information_transformation <- function(fit) {
+  family <- fit$family$family
+  # Constant-information scale transformation of the linear predictor.
+  # See page 308 of Generalized linear models with examples in R.
+  transformation <- if (family == "binomial") {
+    function(x) asin(sqrt(x))
+  } else if (family == "poisson") {
+    function(x) sqrt(x)
+  } else if (family == "gamma") {
+    function(x) log(x)
+  } else {
+    function(x) { stop("not implemented")}
+  }
+}
+my_diagnostics <- function(fit) {
+  transformation <- constant_information_transformation(fit)
+  par(mfrow = c(2, 2))
+  qr <- qresid(fit)
+  qqnorm(qr, las=1); qqline(qr)
+  plot(qr ~ asin(sqrt(fitted(fit))), las=1)   # sin^-1(sqrt(mu)) is the constant-information scale transformation for Binomial distribution    
+  plot(cooks.distance(fit), type="h", las=1)
+  plot(hatvalues(fit), type="h", las=1)
+}
+fit <- logistic_fit_1 %>% extract_fit_engine()
+my_diagnostics(fit)
+```
+
+```{r}
+my_diagnostics2 <- function(fit) {
+  transformation <- constant_information_transformation(fit)
+  par(mfrow = c(1, 2))
+  use_deviance_residuals <- TRUE
+  if (use_deviance_residuals) {
+    label <- "Standardized deviance residuals"
+    standardized_residuals <- rstandard(fit)
+  } else {
+    label <- "Standardized quantile residuals"
+    standardized_residuals <- qresid(fit) / sqrt(1 - hatvalues(fit))
+  }
+  scatter.smooth(standardized_residuals ~ transformation(fitted(fit)), las=1,
+                 ylab=label,
+                 xlab="Constant information fitted")
+  z <- resid(fit, type="working") + fit$linear.predictors
+  plot(z ~ fit$linear.predictors, las=1, xlab="Working responses",
+       ylab="Linear predictor")
+  abline(0, 1)
+}
+my_diagnostics2(fit)
+```
+
+
+```{r}
+my_ggdiagnostics <- function(fit) {
+  transformation <- constant_information_transformation(fit)
+  #par(mfrow = c(2, 2))
+  qr <- qresid(fit)
+  #qqnorm(qr, las=1); qqline(qr)
+  use_deviance_residuals <- TRUE
+  if (use_deviance_residuals) {
+    label <- "Standardized\ndeviance residuals"
+    standardized_residuals <- rstandard(fit)
+  } else {
+    label <- "Standardized\nquantile residuals"
+    standardized_residuals <- qresid(fit) / sqrt(1 - hatvalues(fit))
+  }
+  df <- tibble(qr = qr, 
+               standardized_residuals = standardized_residuals,
+               cit_fitted = transformation(fitted(fit)),
+               linear_predictor = fit$linear.predictors,
+               cook = cooks.distance(fit),
+               hat  = hatvalues(fit),
+               z = resid(fit, type="working") + fit$linear.predictors,   # Working responses
+               index = 1:length(qr))
+  g1 <- df %>% ggplot(aes(sample=qr)) + 
+    geom_abline(slope=1, intercept = 0, color="red") +
+    geom_qq() + labs(x="Theoretical quantiles", y="Sample quantiles")
+  #plot(qr ~ asin(sqrt(fitted(fit))), las=1)   # sin^-1(sqrt(mu)) is the constant-information scale transformation for Binomial distribution    
+  g2 <- df %>%
+    ggplot(aes(x=cit_fitted, y=qr)) +
+    geom_point() + geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs")) +
+    labs(x="Constant information fitted", y="Quantile residual")
+  g3 <- df %>% 
+    ggplot(aes(x=index, y=cook, xend=index, yend=0)) +
+    geom_segment() + labs(x="Index", y="Cook's distance")
+  g4 <- df %>% 
+    ggplot(aes(x=index, y=hat, xend=index, yend=0)) +
+    geom_segment() + labs(x="Index", y="Hatvalue")
+  
+  # Why does the fitted curve look different from the one created by base graphics?
+  g5 <- df %>%
+    ggplot(aes(x=cit_fitted, y=standardized_residuals)) +
+    geom_point() + 
+    geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs")) +
+    #geom_smooth(method = "loess", span=2/3, method.args=list(span = 2/3, degree = 1, family="gaussian"), se=FALSE) +
+    labs(y=label, x = "Constant information fitted")
+  # scatter.smooth(standardized_residuals ~ transformation(fitted(fit)), las=1,
+  #                ylab=label,
+  #                xlab="Constant information fitted")
+  
+  g6 <- df %>%
+    ggplot(aes(x=linear_predictor, y=z)) +
+    geom_point() + geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs")) +
+    labs(x="Working responses", y="Linear predictor")
+  # plot(z ~ fit$linear.predictors, las=1, xlab="Working responses",
+  #      ylab="Linear predictor")
+  # abline(0, 1)
+  #plot(cooks.distance(fit), type="h", las=1)
+  #plot(hatvalues(fit), type="h", las=1)
+  (g1 + g2) / (g3 + g4) / (g5 + g6)
+}
+```
+
+
+```{r}
+my_ggdiagnostics(fit)
+```
+
+```{r}
+variable_plots <- function(fit, variables="age") {
+  df1 <- fit$data %>% select(all_of(variables)) %>%
+    mutate(y = rstandard(fit)) %>% 
+    pivot_longer(cols = variables, values_to="x", names_to = "variable")
+  # df1 <- tibble(standardized_residuals = rstandard(fit),
+  #               value = fit$data$age)
+  # g1 <- df1 %>% ggplot(aes(x=value, y=standardized_residuals)) + geom_point() +
+  #   labs(x="age", y="Standardized deviance residuals")
+  # Partial residual plot
+  # This probably does not make sense when model contains interactions
+  tmp <- termplot(fit, data=fit$data, 
+                  partial.resid = TRUE, terms = variables, las=1, plot = FALSE)
+  df2 <- bind_rows(tmp, .id="variable") %>% as_tibble()
+  df <- bind_rows(full=df1, partial=df2, .id="type")
+  #g2 <- df2 %>% ggplot(aes(x, y)) + geom_point() + labs(x="age")
+  g <- df %>% ggplot(aes(x, y)) + geom_point() +
+    labs(x="value", y="residual") +
+    ggh4x::facet_grid2(rows=vars(variable), cols=vars(type),
+                       #variable ~ type, 
+                       scales="free", independent=TRUE) 
+  #g1 + g2
+  g
+}
+```
+
+```{r}
+variable_plots(fit)
+```
+
+## Model 5 C282Y wild only
+
+
+```{r}
+variables5_wild <- c("sex", "age",
+                "H63D", "S65C",
+                "C282Y",
+                "H1_2",
+                "supersnip",
+                #"credible1",
+                "rs3094093", "rs114179634"
+                )
+f5_wild <- sprintf("hemochromatosis ~ %s",
+             paste(variables5_wild, collapse = " + "))
+f5_wild
+```
+
+
+```{r}
+logistic_mod_5 <- parsnip::logistic_reg()
+logistic_mod_5
+```
+
+```{r}
+logistic_recipe_5_wild <-
+  recipe(as.formula(f5_wild), data=train) %>%
+  step_filter(C282Y == 0) %>%
+  step_rm(C282Y) %>%
+  #step_relevel(hemochromatosis, ref_level = "control") %>%
+  step_normalize(age) %>%
+  step_mutate(H1_2 = as.factor(round(H1_2)),
+              H63D = as.factor(round(H63D))) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_lincomb(all_numeric_predictors())
+logistic_recipe_5_wild
+```
+
+```{r}
+logistic_wflow_5_wild <-
+  workflow() %>%
+  add_model(logistic_mod_5) %>%
+  add_recipe(logistic_recipe_5_wild)
+logistic_wflow_5_wild
+```
+
+```{r}
+filename <- file.path(result_path, "logistic_lf_5_wild.rds")
+if (! file.exists(filename) || recompute) {
+  logistic_fit_5_wild <- logistic_wflow_5_wild %>%
+    fit(data = train)
+  saveRDS(logistic_fit_5_wild, filename)
+} else {
+  logistic_fit_5_wild <- readRDS(filename)
+}
+logistic_fit_5_wild
+```
+
+```{r}
+broom::glance(logistic_fit_5_wild)
+```
+
+Variance inflation factors.
+
+```{r}
+logistic_fit_5_wild %>% extract_fit_engine() %>% car::vif() %>% sort(decreasing = TRUE)
+```
+
+```{r}
+logistic_fit_5_wild %>% extract_fit_engine() %>% plot()
+```
+
+```{r}
+logistic_fit_5_wild %>% extract_fit_engine() %>% fmsb::NagelkerkeR2()
+```
+
+
+```{r}
+filename <- file.path(table_path, "logistic_cis_5_wild.tsv")
+if (! file.exists(filename) || recompute) {
+  logistic_cis_5_wild <- compute_cis(logistic_fit_5_wild)
+  write_tsv(logistic_cis_5_wild, filename)
+} else
+  logistic_cis_5_wild <- read_tsv(filename)
+```
+
+
+
+
+```{r}
+filename <- file.path(figure_path, "logistic_cis_5_wild.pdf")
+g <- plot_cis(logistic_cis_5_wild, "Logistic model 5 wild UKBB", subtitle=model_stats(logistic_fit_5_wild))
+ggsave(filename, g)
+g
+```
+
+## Model 6
+
+Comparison model between FinnGen and UKBB.
+
+### Logistic regression
+
+```{r}
+variables6 <- c("sex", "age",
+                "H63D", "S65C", "C282Y", "supersnip",
+                "rs3094093", "rs114179634"
+                #credible_snip_names2
+                )
+f6 <- sprintf("hemochromatosis ~ %s",
+             paste(variables6, collapse = " + "))
+f6
+```
+
+
+```{r}
+logistic_mod_6 <- parsnip::logistic_reg()
+logistic_mod_6
+```
+
+```{r}
+logistic_recipe_6 <-
+  recipe(as.formula(f6), data=train) %>%
+  #step_relevel(hemochromatosis, ref_level = "control") %>%
+  step_normalize(age) %>%
+  step_mutate(C282Y = as.factor(round(C282Y)),
+              H63D = as.factor(round(H63D))) %>%
+  step_dummy(all_nominal_predictors(), H63D, C282Y) %>%
+  step_interact(terms = ~ starts_with("C282Y") :
+                  c(starts_with("H63D"), S65C, supersnip, starts_with("sex"))) %>%
+  step_lincomb(all_numeric_predictors())
+logistic_recipe_6
+```
+
+```{r}
+logistic_wflow_6 <-
+  workflow() %>%
+  add_model(logistic_mod_6) %>%
+  add_recipe(logistic_recipe_6)
+logistic_wflow_6
+```
+
+#### Fit 
+
+```{r}
+filename <- file.path(result_path, "logistic_lf_6.rds")
+if (! file.exists(filename) || recompute) {
+  logistic_fit_6 <- logistic_wflow_6 %>%
+    fit(data = train)
+  saveRDS(logistic_fit_6, filename)
+} else {
+  logistic_fit_6 <- readRDS(filename)
+}
+logistic_fit_6
+```
+
+Fit on full data.
+
+```{r}
+filename <- file.path(result_path, "logistic_full_6.rds")
+if (! file.exists(filename) || recompute) {
+  logistic_full_6 <- logistic_wflow_6 %>%
+    fit(data = basic_combined)
+  saveRDS(logistic_full_6, filename)
+} else {
+  logistic_full_6 <- readRDS(filename)
+}
+logistic_full_6
+```
+
+#### Diagnostics
+
+```{r}
+broom::glance(logistic_fit_6)
+```
+
+Variance inflation factors.
+
+```{r}
+logistic_fit_6 %>% extract_fit_engine() %>% car::vif() %>% sort(decreasing = TRUE)
+```
+
+```{r}
+logistic_fit_6 %>% extract_fit_engine() %>% plot()
+```
+
+```{r}
+logistic_fit_6 %>% extract_fit_engine() %>% my_ggdiagnostics()
+```
+
+```{r}
+#par(mfrow = c(3, 3))
+fit <- logistic_fit_6 %>% extract_fit_engine()
+termplot(fit, data=fit$data, partial.resid = TRUE, terms = "age", las=1, rug=TRUE)
+```
+
+
+
+```{r}
+#fit %>% variable_plots(c("age", "sex_female"))
+fit %>% variable_plots(c("age"))
+```
+
+Calibration.
+
+```{r}
+logistic_fit_6_test_pred <- augment(logistic_fit_6, new_data = test)
+logistic_fit_6_test_pred %>%
+  cal_plot_windowed(truth = hemochromatosis, estimate = .pred_case, step_size = 0.025, event_level = "second")
+```
+
+```{r}
+logistic_fit_6 %>% extract_fit_engine() %>% fmsb::NagelkerkeR2()
+```
+
+#### Forest plots
+
+```{r}
+filename <- file.path(table_path, "logistic_cis_6.tsv")
+if (! file.exists(filename) || recompute) {
+  logistic_cis_6 <- compute_cis(logistic_fit_6)
+  write_tsv(logistic_cis_6, filename)
+} else
+  logistic_cis_6 <- read_tsv(filename)
+```
+
+```{r}
+filename <- file.path(table_path, "logistic_cis_full_6.tsv")
+if (! file.exists(filename) || recompute) {
+  logistic_cis_full_6 <- compute_cis(logistic_full_6)
+  write_tsv(logistic_cis_full_6, filename)
+} else
+  logistic_cis_full_6 <- read_tsv(filename)
+```
+
+
+
+```{r}
+filename <- file.path(figure_path, "logistic_cis_6.pdf")
+g <- plot_cis(logistic_cis_6, "Logistic model 6 UKBB", subtitle=model_stats(logistic_fit_6))
+ggsave(filename, g, width=7, height=7)
+g
+```
+
+```{r}
+filename <- file.path(figure_path, "logistic_cis_full_6.pdf")
+g <- plot_cis(logistic_cis_full_6, "Logistic model 6 full UKBB", subtitle=model_stats(logistic_full_6))
+ggsave(filename, g, width=7, height=7)
+g
+```
+
+#### Risk table
+
+Compute confidence intervals for predictions for multiple predictor combinations.
+
+```{r}
+data6 <- expand_grid(sex = c("male", "female"), age=mean(train$age), H63D=0:2, S65C=0, C282Y=0:2, 
+                     supersnip=0:2, rs3094093=2, rs114179634=0, hemochromatosis = "case") %>%
+  mutate(across(c(sex), as.factor),
+         hemochromatosis = factor(hemochromatosis, levels=c("case", "control")))
+important_predictors6 <- c(Sex="sex", "H63D", "C282Y", HLA3="supersnip") %>% fill_names()
+
+cat("The following variables were fixed during the computation of probabilities\n")
+fixed_predictors6 <- get_fixed_predictors(data6, important_predictors6)
+fixed_predictors6
+```
+
+```{r}
+# filename <- file.path(figure_path, "risk_table_6.pdf")
+# p <- risk_table(logistic_fit_6, data6, important_predictors6, filename, title=sprintf("UKBB 6, %s", fixed_predictors6))
+# plot(p, new_page=TRUE)
+```
+
+```{r, fig.width = 12, fig.height = 7}
+title <- "Model 6 train data"
+filename <- file.path(table_path, "risk_table_6_train.tsv")
+if (! file.exists(filename) | recompute) {
+  result  <- compute_risk_table(logistic_fit_6, data6, important_predictors6, count_data = train, col="sex", conf.level = 0.95)
+  result2 <- compute_risk_table(logistic_fit_6, data6, important_predictors6, count_data = train, col="sex", conf.level = 0.80)
+  result <- bind_rows(result, result2)
+  write_tsv(result, filename)
+} else {
+  result <- read_tsv(filename)
+}
+p <- plot_risk_table(result, important_predictors6, title=title, col = "sex", conf.level = c(0.95, 0.80))
+if (save_figs) {
+  filename <- file.path(figure_path, "risk_table_6_train.pdf")
+  pdf(filename, width=12, height=7, title=title)
+  plot(p[[1]], new_page=TRUE)
+  plot(p[[2]], new_page=FALSE)
+  invisible(dev.off())
+}
+#dev.new()
+plot(p[[1]], new_page=TRUE)
+plot(p[[2]], new_page=FALSE)
+```
+
+```{r, fig.width = 12, fig.height = 7}
+title <- "Model 6 full data"
+filename <- file.path(table_path, "risk_table_6_full.tsv")
+if (! file.exists(filename) | recompute) {
+  result  <- compute_risk_table(logistic_full_6, data6, important_predictors6, count_data = basic_combined, col="sex", conf.level = 0.95)
+  result2 <- compute_risk_table(logistic_full_6, data6, important_predictors6, count_data = basic_combined, col="sex", conf.level = 0.80)
+  result <- bind_rows(result, result2)
+  write_tsv(result, filename)
+} else {
+  result <- read_tsv(filename)
+}
+p <- plot_risk_table(result, important_predictors6, title=title, col = "sex", conf.level = c(0.95, 0.80))
+if (save_figs) {
+  filename <- file.path(figure_path, "risk_table_6_full.pdf")
+  pdf(filename, width=12, height=7, title=title)
+  plot(p[[1]], new_page=TRUE)
+  plot(p[[2]], new_page=FALSE)
+  invisible(dev.off())
+}
+#dev.new()
+plot(p[[1]], new_page=TRUE)
+plot(p[[2]], new_page=FALSE)
+```
+
+### Cox regression
+
+```{r}
+variables6_cox <- c("sex",
+                "H63D", "S65C", "supersnip",
+                "rs3094093", "rs114179634",
+                "C282Y", 
+                #credible_snip_names2
+                "C282Y:(H63D + S65C + supersnip + sex)"
+                )
+f6_cox <- sprintf("Surv(survival_age, hemochromatosis) ~ %s",
+             paste(variables6_cox, collapse = " + "))
+f6_cox
+```
+
+#### Fit
+
+```{r}
+cox_train <- train %>% mutate(hemochromatosis = as.integer(hemochromatosis == "case"),
+                              across(c(C282Y, H63D), as.factor))
+filename <- file.path(result_path, "cox_fit_6.rds")
+if (! file.exists(filename) || recompute) {
+  cox_fit_6 <- survival::coxph(as.formula(f6_cox), data=cox_train)
+  saveRDS(cox_fit_6, filename)
+} else {
+  cox_fit_6 <- readRDS(filename)
+}
+summary(cox_fit_6)
+```
+
+Fit on full data.
+
+```{r}
+cox_full <- basic_combined %>% mutate(hemochromatosis = as.integer(hemochromatosis == "case"),
+                              across(c(C282Y, H63D), as.factor))
+filename <- file.path(result_path, "cox_full_6.rds")
+if (! file.exists(filename) || recompute) {
+  cox_full_6 <- survival::coxph(as.formula(f6_cox), data=cox_full)
+  saveRDS(cox_full_6, filename)
+} else {
+  cox_full_6 <- readRDS(filename)
+}
+summary(cox_full_6)
+```
+
+#### Diagnostics.
+
+Test the proportinal hazards assumption.
+
+```{r}
+cox_ftest_6 <- cox.zph(cox_fit_6)
+cox_ftest_6
+```
+
+Only rs3094093 (HLA2) seems to deviate from the proportional hazards assumption.
+After fixing survival age, more deviations appeared.
+
+```{r, fig.width=14, fig.height=14}
+# w <- tryCatch(
+#   warning = function(w) {invokeRestart("muffleWarning")}, 
+#   quiet=TRUE,
+#   ggcoxzph(cox_ftest_6)
+# )
+# w <- withCallingHandlers(warning = function(w) {},
+#   ggcoxzph(cox_ftest_6)
+# )
+# logWarning <- function(w)
+# {
+#   #cat("Hola\n")
+# }
+# x <- tryCatch(
+#   withCallingHandlers(ggcoxzph(cox_ftest_6), 
+#                       warning = function(w) logWarning(w),
+#                       quiet = TRUE),
+#   quiet=TRUE,
+#   error=function(cnd) return(cnd)
+# )
+grid.newpage()
+print(suppressWarnings(ggcoxzph(cox_ftest_6)), newpage=FALSE)
+```
+
+Following does not work for some reason. Causes R to hang.
+
+```{r, eval=FALSE}
+ggcoxdiagnostics(cox_fit_6,
+                 type = "deviance",
+                 ox.scale = "linear.predictions")
+```
+
+Full data.
+
+```{r}
+cox_ftest_full_6 <- cox.zph(cox_full_6)
+cox_ftest_full_6
+```
+
+```{r, fig.width=14, fig.height=14}
+grid.newpage()
+print(suppressWarnings(ggcoxzph(cox_ftest_full_6)), newpage=FALSE)
+```
+
+#### Forest plots
+
+Extract confidence intervals.
+
+```{r}
+filename <- sprintf("%s/cox_cis_6.tsv", table_path)
+if (recompute || ! file.exists(filename)) {
+  cox_cis_6 <- tidy(cox_fit_6, conf.int = TRUE, exponentiate = TRUE) %>% 
+    drop_na(estimate)    # Some interacting levels don't exist in the date, we drop them here
+  write_tsv(cox_cis_6, filename)
+} else {
+  cox_cis_6 <- read_tsv(filename)
+}
+```
+
+```{r}
+filename <- sprintf("%s/cox_cis_full_6.tsv", table_path)
+if (recompute || ! file.exists(filename)) {
+  cox_cis_full_6 <- tidy(cox_full_6, conf.int = TRUE, exponentiate = TRUE) %>% 
+    drop_na(estimate)    # Some interacting levels don't exist in the date, we drop them here
+  write_tsv(cox_cis_full_6, filename)
+} else {
+  cox_cis_full_6 <- read_tsv(filename)
+}
+```
+
+Make forest plots.
+
+```{r}
+g <- plot_cis(cox_cis_6, "Cox model 6 UKBB") +
+  labs(x="Hazard ratio") +
+  theme(axis.title.y = element_blank())
+if (save_figs) {
+  filename <- sprintf("%s/cox_cis_6.pdf", figure_path)
+  ggsave(filename,  g, width=180, height = 120, units="mm", dpi=300, scale=1.0, device="pdf")
+}
+g
+```
+
+```{r}
+g <- plot_cis(cox_cis_full_6, "Cox model 6 full UKBB") +
+  labs(x="Hazard ratio") +
+  theme(axis.title.y = element_blank())
+if (save_figs) {
+  filename <- sprintf("%s/cox_cis_full_6.pdf", figure_path)
+  ggsave(filename,  g, width=180, height = 120, units="mm", dpi=300, scale=1.0, device="pdf")
+}
+g
+```
+
+## Old stuff
+
+### Precision-recall
+
+#### Training set.
+
+```{r, eval=FALSE}
+compute_helper <- function(model, newdata=NULL, boot.n=2000) {
+  pred <- augment(logistic_mod_1, type.predict = "link")
+  g <- pred %>% ggplot(aes(.fitted)) + geom_histogram()
+  distribution_df <- pred %>% select(hemochromatosis, .fitted) %>% summary()
+  res <- create_precision_recall_new(pred$hemochromatosis, pred$.fitted, boot.n=boot.n)
+  list(distribution=g, distribution_df=distribution_df, pr_plot=res$pr_plot, pr_ci=res$pr_ci)
+}
+```
+
+```{r, eval=FALSE}
+filename <- file.path(result_path, "res_train_1.rds")
+if (! file.exists(filename)) {
+  res_train_1 <- compute_helper(logistic_mod_1, boot.n=boot.n)
+  saveRDS(res_train_1, filename)
+} else 
+  res_train_1 <- readRDS(filename)
+res_train_1
+```
+
+
+
+
+
+#### Test set.
+
+```{r, eval=FALSE}
+filename <- file.path(result_path, "res_test_1.rds")
+if (! file.exists(filename)) {
+  res_test_1 <- compute_helper(logistic_mod_1, model_test_data, boot.n=boot.n)
+  saveRDS(res_test_1, filename)
+} else 
+  res_test_1 <- readRDS(filename)
+res_test_1
+```
+
+
+
+
+
+
+
+
+

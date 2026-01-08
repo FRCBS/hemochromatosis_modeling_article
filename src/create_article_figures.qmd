@@ -1,0 +1,1885 @@
+---
+title: "Create article results"
+author: "Jarkko Toivonen"
+format: html
+---
+
+## Setup
+
+```{r setup}
+library(tidyverse)
+library(meta)
+library(patchwork)
+library(ggrepel)
+library(openxlsx)
+library(exclude)
+library(glue)
+
+source("common.R")
+
+result_path <- "../results"
+table_path <- file.path(result_path, "tables")
+figure_path <- file.path(result_path, "figures")
+progression_table_path  <- file.path(result_path, "progression", "tables")
+
+final_result_path <- file.path(result_path, "final")
+final_table_path <- file.path(final_result_path, "tables")
+final_figure_path <- file.path(final_result_path, "figures")
+
+recompute <- FALSE
+save_figs <- FALSE
+save_tables <- FALSE
+```
+
+## Functions
+
+```{r}
+#mylabeller <- unique(dosage$name) %>% set_names() %>% assign_in("supersnip", "HLA3") %>% as_labeller()
+my_as_labeller <- function(conv) { as_labeller(function(v) coalesce(conv[v], v)) }
+```
+
+
+```{r}
+reverse_interactions <- function(v, delim = "_x_") {
+  #interactions <- df %>% filter(str_detect(term, "_x_"))
+  #other <- df %>% filter(! str_detect(term, "_x_"))
+  # df <- tibble(v = v)
+  # df <- df %>% separate_wider_delim(v, delim="_x_", names=c("X1", "X2"))
+  # paste(df$X2, df$X1, sep="_x_")
+  L <- str_split(v, pattern=delim)
+  helper <- function(x) {
+    if (length(x) == 2) paste(x[2], x[1], sep=delim) else x
+  }
+  map_chr(L, helper)
+}
+```
+
+```{r}
+
+```
+
+## Forest plot
+
+### Load Finngen datas
+
+#### Train data
+
+```{r eval=FALSE}
+# Comparison model
+filename <- file.path(table_path, "logistic_cis_6.tsv")
+fg_logistic_cis_6 <- read_tsv(filename, show_col_types = FALSE) %>%
+  mutate(term = reverse_interactions(term))
+filename <- file.path(table_path, "cox_cis_6.tsv")
+fg_cox_cis_6 <- read_tsv(filename, show_col_types = FALSE)
+```
+
+
+```{r, eval=FALSE}
+# Best FinnGen model
+filename <- file.path(table_path, "logistic_cis_5.tsv")
+fg_logistic_cis_5 <- read_tsv(filename, show_col_types = FALSE) %>%
+  mutate(term = reverse_interactions(term))
+filename <- file.path(table_path, "cox_tdc_cis_5.tsv")
+fg_cox_cis_5 <- read_tsv(filename, show_col_types = FALSE) %>%
+  mutate(term = if_else(str_starts(term, "C282Y"), reverse_interactions(term, delim=":"), term))
+```
+
+
+```{r, eval=FALSE}
+# Progression model
+filename <- file.path(progression_table_path, "cis_zip2.tsv")
+fg_zip2_count <- read_tsv(filename, show_col_types = FALSE) %>%
+  mutate(term = if_else(str_starts(term, "C282Y"), reverse_interactions(term, delim=":"), term))
+filename <- file.path(progression_table_path, "cis_zero_zip2.tsv")
+fg_zip2_zero <- read_tsv(filename, show_col_types = FALSE) %>%
+  mutate(term = if_else(str_starts(term, "C282Y"), reverse_interactions(term, delim=":"), term))
+```
+
+#### Full data model
+
+```{r}
+# Comparison model, full data
+filename <- file.path(table_path, "logistic_cis_full_6.tsv")
+fg_logistic_cis_full_6 <- read_tsv(filename) %>%
+  mutate(term = reverse_interactions(term))
+filename <- file.path(table_path, "cox_cis_full_6.tsv")
+fg_cox_cis_full_6 <- read_tsv(filename)
+```
+
+```{r}
+# Best FinnGen model
+filename <- file.path(table_path, "logistic_cis_full_5.tsv")
+fg_logistic_cis_full_5 <- read_tsv(filename, show_col_types = FALSE) %>%
+  mutate(term = reverse_interactions(term))
+filename <- file.path(table_path, "cox_tdc_cis_full_5.tsv")
+fg_cox_cis_full_5 <- read_tsv(filename, show_col_types = FALSE) %>%
+  mutate(term = if_else(str_starts(term, "C282Y"), reverse_interactions(term, delim=":"), term))
+```
+
+```{r}
+# Progression model
+filename <- file.path(progression_table_path, "cis_zip2_full.tsv")
+fg_zip2_count_full <- read_tsv(filename, show_col_types = FALSE) %>%
+  mutate(term = if_else(str_starts(term, "C282Y"), reverse_interactions(term, delim=":"), term))
+#filename <- file.path(progression_table_path, "cis_zero_zip2_full.tsv")
+#fg_zip2_zero_full <- read_tsv(filename, show_col_types = FALSE) %>%
+#  mutate(term = if_else(str_starts(term, "C282Y"), reverse_interactions(term, delim=":"), term))
+```
+  
+### Load UKBB datas
+
+#### Train data
+
+```{r}
+filename <- file.path(table_path, "ukbb_logistic_cis_6.tsv")
+ukbb_logistic_cis_6 <- read_tsv(filename) %>%
+  mutate(term = reverse_interactions(term))
+filename <- file.path(table_path, "ukbb_cox_cis_6.tsv")
+ukbb_cox_cis_6 <- read_tsv(filename)
+```
+
+#### Full data
+
+```{r}
+filename <- file.path(table_path, "ukbb_logistic_cis_full_6.tsv")
+ukbb_logistic_cis_full_6 <- read_tsv(filename) %>%
+  mutate(term = reverse_interactions(term))
+filename <- file.path(table_path, "ukbb_cox_cis_full_6.tsv")
+ukbb_cox_cis_full_6 <- read_tsv(filename)
+```
+
+### Meta-analysis
+
+#### Functions
+
+```{r}
+# Done according to the following doc "Meta-analysis in R":
+# https://pharmasug.org/proceedings/2023/DV/PharmaSUG-2023-DV-287.pdf
+# Nota that the study labels are in the model column of the input dataframe
+meta_analyze <- function(data = data, measure = "OR") {
+  m <- meta::metagen(
+    TE = log(estimate), seTE = std.error,
+    data = data,
+    sm = measure, 
+    common=T, random=T,  # parameter "fixed" is now "common"
+    studlab = model,     # Study labels  
+    method.tau = "DL", ## method to calculate Tau
+    method.random.ci = "classic", ## method to calculate estimator's CI
+  )
+  a <- tibble(model = "random", term=data$term[1], estimate = exp(m$TE.random), std.error = m$seTE.random, statistic = m$statistic.random,
+         p.value = m$pval.random, conf.low = exp(m$lower.random), conf.high = exp(m$upper.random))
+  b <- tibble(model = "fixed", term=data$term[1], estimate = exp(m$TE.fixed), std.error = m$seTE.fixed, statistic = m$statistic.fixed,
+         p.value = m$pval.fixed, conf.low = exp(m$lower.fixed), conf.high = exp(m$upper.fixed))
+  # The common is the same as fixed
+  c <- tibble(model = "common", term=data$term[1], estimate = exp(m$TE.common), std.error = m$seTE.common, statistic = m$statistic.common,
+         p.value = m$pval.common, conf.low = exp(m$lower.common), conf.high = exp(m$upper.common))
+  bind_rows(a, b)
+}
+```
+
+```{r}
+mylevels <- c("fg", "ukbb", "random", "fixed")
+mylabels <- c("FinnGen", "UKBB", "Random-effect meta-analysis", "Fixed-effect meta-analysis")
+# Combine results from different models
+combine_and_meta_analyse <- function(fg_cis, ukbb_cis, measure="OR") {
+  cis <- bind_rows(fg=fg_cis, ukbb=ukbb_cis, .id="model") %>%
+    mutate(model = factor(model, levels=rev(mylevels))) %>% 
+    filter(! is.na(estimate))
+  if (measure == "HR") {
+    cis <- cis %>%
+      bind_rows(tibble(model=c("fg", "ukbb"), term="age")) # Add dummy row because age is not predictor in Cox model
+  }
+  # Meta-analyse all terms
+  meta_analyse_cis <- cis %>% 
+    group_by(term) %>% 
+    group_map(function(data, key) meta_analyze(data, measure=measure), .keep = TRUE) %>% 
+    bind_rows()
+  # Add meta-analysis results to the original results
+  cis <- cis %>% 
+    bind_rows(meta_analyse_cis) %>%
+    mutate(model = factor(model, levels=rev(mylevels))) 
+  cis
+}
+```
+
+#### Train data
+
+##### Logistic comparison model.
+
+
+```{r}
+logistic_cis_6 <- combine_and_meta_analyse(fg_logistic_cis_6, ukbb_logistic_cis_6, measure="OR")
+
+g1 <- plot_cis2(logistic_cis_6, "Logistic model 6") + labs(y="Variable", color="Model") +
+  theme(axis.title.y = element_blank()) + 
+  scale_color_discrete(breaks = mylevels, 
+                       labels = mylabels)
+g1
+```
+
+##### Cox comparison model.
+
+```{r}
+cox_cis_6 <- combine_and_meta_analyse(fg_cox_cis_6, ukbb_cox_cis_6, measure="HR")
+
+g2 <- plot_cis2(cox_cis_6, "Cox model 6") + labs(y="Variable", x="Hazard ratio", color="Model") +
+  theme(axis.title.y = element_blank()) + 
+  scale_color_discrete(breaks = mylevels, labels = mylabels)
+g2
+```
+
+##### Both
+
+```{r}
+(g1 | g2) + plot_layout(axes = "collect_y", guides="collect")
+```
+
+#### Full data
+
+##### Both
+
+```{r}
+logistic_cis_full_6 <- combine_and_meta_analyse(fg_logistic_cis_full_6, ukbb_logistic_cis_full_6, measure="OR")
+cox_cis_full_6 <- combine_and_meta_analyse(fg_cox_cis_full_6, ukbb_cox_cis_full_6, measure="HR")
+if (save_tables) {
+  filename <- file.path(table_path, "logistic_comparison_model.tsv")
+  tmp <- logistic_cis_full_6 %>% 
+    filter(model != "random") %>%
+    mutate(model = if_else(model=="fixed", "meta-analysis", model),
+           pretty_term = prettify(term), .after="term")
+  write_tsv(tmp, filename)
+}
+g3 <- plot_cis2(logistic_cis_full_6, "Logistic model full 6") + labs(y="Variable", color="Model") +
+  theme(axis.title.y = element_blank()) + 
+  scale_color_discrete(breaks = mylevels, 
+                       labels = mylabels)
+g4 <- plot_cis2(cox_cis_full_6, "Cox model full 6", na.rm=TRUE) + labs(x="Hazard ratio", y="Variable", color="Model") +
+  theme(axis.title.y = element_blank()) + 
+  scale_color_discrete(breaks = mylevels, 
+                       labels = mylabels)
+(g3 | g4) + plot_layout(axes = "collect_y", guides="collect")
+```
+
+### Best FinnGen model
+
+#### Train data
+
+```{r}
+#mylevels2 <- c("logistic", "logistic_meta", "cox", "cox_meta")
+mylevels2 <- c("finngen", "meta_analysis")
+mylabels2 <- c("Best FinnGen", "Meta-analysis")
+cis_5 <- bind_rows(logistic=fg_logistic_cis_5, 
+                   cox=fg_cox_cis_5,
+                   #logistic_meta = logistic_meta_analyse_cis_6 %>% filter(model=="fixed"),
+                   #cox_meta = cox_meta_analyse_cis_6 %>% filter(model=="fixed"),
+                   logistic_meta = logistic_cis_6 %>% filter(model=="fixed"),
+                   cox_meta = cox_cis_6 %>% filter(model=="fixed"),
+                   .id="model") %>%
+  mutate(
+         type = if_else(model %in% c("logistic", "logistic_meta"), "logistic", "cox") %>% 
+           factor(levels=c("logistic", "cox")),
+         population = if_else(str_detect(model, "meta"), "meta_analysis", "finngen") %>%
+           factor(levels = mylevels2)) %>%
+  filter(! is.na(estimate)) #%>%
+  #mutate(term = reverse_interactions(term))
+g <- cis_5 %>%
+  mutate(model = fct_rev(population)) %>%
+  plot_cis2("Model 5") + 
+  labs(y="Variable", color="Model", x="Odds/hazard ratio") +
+  theme(axis.title.y = element_blank(), plot.title = element_blank()) + 
+  facet_grid(~type) +
+  scale_color_discrete(breaks = mylevels2, labels = mylabels2)
+  #scale_color_discrete(breaks = mylevels2)#, labels = c("FinnGen", "UKBB"))
+filename <- file.path(figure_path, "meta_vs_best.pdf")
+if (save_figs)
+  ggsave(filename, g, title="Meta vs best", width=7, height=7)
+g
+```
+
+### All models
+
+#### Train data, FinnGen only
+
+```{r}
+mylevels3 <- c("logistic", "cox", "count", "zero")
+mylabels3 <- c("Best FinnGen logistic", "Best FinnGen Cox", "Venesections: count", "Venesections: zero")
+fg_zip2_cis <- bind_rows(count=fg_zip2_count, zero=fg_zip2_zero, .id="component")
+g <- fg_zip2_cis %>% 
+  mutate(model = component) %>%
+  bind_rows(cis_5 %>% filter(model %in% c("cox", "logistic"))) %>%
+  mutate(model = factor(model, mylevels3) %>% fct_rev()) %>% 
+  plot_cis2("Progression") + 
+  labs(y="Variable", x="Odds/hazard/incidence ratio", color="Model") +
+  theme(axis.title.y = element_blank(), plot.title=element_blank()) + 
+  scale_color_discrete(breaks = mylevels3, labels = mylabels3)
+  #facet_grid(~component)
+filename <- file.path(figure_path, "progression_vs_best.pdf")
+if (save_figs)
+  ggsave(filename, g, title="Progression vs best")
+g
+```
+
+#### Full data
+
+Variable order.
+
+```{r}
+non_genetic_variables <- c("age", "donations_in_five_years", "sex_female", "sex2pre", "sex2post", "sex2_pre", "sex2_post",   "sexfemale",
+  "M13_ARTHROSISTRUE", "K11_CHOLELITHTRUE", "I9_HYPTENSESSTRUE", "E4_HYTHYNASTRUE", "C3_CANCERTRUE",
+  "M13_ARTHROSIS", "K11_CHOLELITH", "I9_HYPTENSESS", "E4_HYTHYNAS", "C3_CANCER"
+  ) 
+genetic_variables <- c("S65C", "rs114179634", "rs3094093", "supersnip", "credible1", "credible2", "credible3", 
+                       "H63D1", "H63D2", "C282Y1", "C282Y2", 
+  "donations_in_five_years_x_C282Y_X1", 
+  "donations_in_five_years_x_C282Y_X2", 
+  "donations_in_five_years:C282Y1",
+  "donations_in_five_years:C282Y2", 
+  "sex_female_x_C282Y_X1", "sex_female_x_C282Y_X2",  "sexfemale:C282Y1", "sexfemale:C282Y2",
+  "sex2pre:C282Y1", 
+  "sex2_pre_x_C282Y_X1", 
+  "sex2pre:C282Y2", 
+  "sex2_pre_x_C282Y_X2", 
+  "sex2post:C282Y1", 
+  "sex2_post_x_C282Y_X1", 
+  "sex2post:C282Y2",
+  "sex2_post_x_C282Y_X2", 
+  "S65C:C282Y1", 
+  "supersnip_x_C282Y_X1",
+  "supersnip:C282Y1", 
+  "supersnip:C282Y2",
+  "supersnip_x_C282Y_X2",
+  "H63D1:C282Y1", 
+  "H63D_X1", "H63D_X2",  "C282Y_X1", "C282Y_X2", "H63D_X1_x_C282Y_X1", "S65C_x_C282Y_X1")
+all_variables <- c(non_genetic_variables, genetic_variables)
+```
+
+Meta-analysis uses fixed-effects.
+
+```{r}
+# Input is a dataframe that has a factor column whose name is given as parameter
+# Returns a dataframe with three columns
+# stripe column has alternating values 0 and 1
+# bg column contains the background color for that value of variable value
+# the third column contains the levels of the specified column
+make_stripes <- function(df, Variable, colors = c("gray", NA)) {
+  v <- df %>% pull({{Variable}})
+  if (is.factor(v)) {
+    v <- levels(v)
+  } else {
+    v <- sort(unique(v))
+  }
+  tibble({{Variable}} := factor(v, levels=v)) %>% 
+     mutate(stripe = (row_number() - 1) %% 2 + 1,
+            bg = colors[stripe])
+}
+
+geom_stripes <- function(df, Variable, colors = c("gray", NA)) {
+  geom_rect(data=make_stripes(df, Variable, colors), # %>% filter(stripe==0),
+            mapping=aes(ymax = as.numeric(Variable) + 0.5,
+                        ymin = as.numeric(Variable) - 0.5,
+                        fill = I(bg)),
+            #fill = "gray", 
+            xmin=-Inf, xmax=Inf, alpha = 0.5, show.legend = FALSE, colour=NA, inherit.aes = FALSE)
+}
+# Multi color
+plot_cis3 <- function(cis, title, subtitle=NULL, lasso = FALSE, na.rm = FALSE, conversion = pretty_conv,
+                      only_significant = FALSE) {
+  tmp <- 
+  cis %>% 
+    mutate(term = term %>% 
+             #str_remove("TRUE") %>% 
+             fct_relabel(function(v) str_remove(v, "TRUE")) %>%  # Removing it this way, does not mess with the order of levels
+             #fct_relevel(intersect(names(pretty_conv), .)) %>% 
+             fct_relabel(make_prettify_function(conversion)) %>% 
+             fct_rev(),
+           non_significant = conf.low < 1 & conf.high > 1,
+           hollow_color = if_else(non_significant | (lasso & estimate == 1), NA, model))
+  if (only_significant) {
+    tmp <- tmp %>%
+      group_by(term) %>%
+      filter(any(!non_significant, na.rm = TRUE)) %>%
+      ungroup() %>%
+      droplevels()
+  }
+  tmp %>%
+    ggplot(aes(x=estimate, xmin=conf.low, xmax=conf.high, y=term, color=model, fill=hollow_color)) + 
+    geom_stripes(tmp, "term") + 
+    geom_vline(xintercept = 1, color="gray") +
+    geom_linerange(position = position_dodge2(width = 0.9, preserve = "total"), na.rm=na.rm) + 
+    geom_point(position = position_dodge2(width = 0.9, preserve = "total"), shape=21, size=2.0, na.rm=na.rm) +
+    guides(color = guide_legend(override.aes = list(shape = 16) ) ) +
+    scale_fill_discrete(na.value=NA, guide="none") +  
+    scale_x_log10() +
+    labs(title=title, subtitle=subtitle, x="Odds ratio", y="Variable")
+}
+```
+
+For adding the effect alleles to the rsids of Causal and HLA snips.
+
+```{r}
+filename <- file.path(table_path, "snip_table.tsv")
+snip_table <- read_tsv(filename)
+replacements <- snip_table %>% 
+  filter(str_starts(name, "Causal") | str_starts(name, "HLA")) %>% 
+  mutate(new = paste(rsid, `Effect allele`, sep = "-")) %>% 
+  select(rsid, new) %>% deframe()
+pretty_conv_with_effect_alleles <- str_replace_all(pretty_conv, replacements)
+names(pretty_conv_with_effect_alleles) <- names(pretty_conv)
+pretty_conv_with_effect_alleles
+```
+
+```{r}
+#mylevels3 <- c("logistic", "cox", "count", "zero")
+#mylabels3 <- c("Best FinnGen logistic", "Best FinnGen Cox", "Venesections: count", "Venesections: zero")
+old_mymodels <- c(    # Old order of models, for comparison purposes
+  logistic="Best FinnGen logistic", 
+  meta_logistic="Meta-analysis logistic", 
+  cox="Best FinnGen Cox", 
+  meta_cox="Meta-analysis Cox",
+  count="Venesections: count", 
+  zero="Venesections: zero"
+  )
+mymodels <- c(
+  meta_logistic="Meta-analysis incidence", 
+  meta_cox="Meta-analysis survival",
+  logistic="Best FinnGen incidence", 
+  cox="Best FinnGen survival", 
+  count="Severity (number of venesections)", 
+  zero="Venesections: zero"
+  )
+filename <- file.path(table_path, "all_models_full_data_cis.tsv")
+if (! file.exists(filename) || recompute) {
+  all_models_full_data_cis <-
+    # Progression model
+    fg_zip2_count_full %>%
+    mutate(model="count", type="count", population="finngen") %>%
+    # Best FinnGen models
+    #bind_rows(cis_5 %>% filter(model %in% c("cox", "logistic"))) %>%
+    bind_rows(fg_logistic_cis_full_5 %>% mutate(model="logistic", type="logistic", population="finngen"), 
+              fg_cox_cis_full_5 %>% mutate(model="cox", type="cox", population="finngen")) %>%
+    # Meta-analysis of logistic model
+    bind_rows(logistic_cis_full_6 %>% filter(model == "fixed") %>% 
+                mutate(model = "meta_logistic", type = "logistic", population="meta_analysis")) %>%
+    # Meta-analysis of cox model
+    bind_rows(cox_cis_full_6 %>% filter(model == "fixed") %>% 
+                mutate(model = "meta_cox", type = "cox", population="meta_analysis")) %>%
+    mutate(population = factor(population, c("finngen", "meta_analysis")),
+           type       = factor(type,       c("count", "cox", "logistic")),
+           model      = factor(model,      names(mymodels))) %>%
+    mutate(across(model, fct_rev))
+  write_tsv(all_models_full_data_cis, filename)
+} else {
+  all_models_full_data_cis <- read_tsv(filename, show_col_types = FALSE)
+  all_models_full_data_cis <- all_models_full_data_cis %>%                 # Factor levels get lost when storing as tsv
+    mutate(population = factor(population, c("finngen", "meta_analysis")),
+           type       = factor(type,       c("count", "cox", "logistic")),
+           model      = factor(model,      names(mymodels))) %>%
+    mutate(across(model, fct_rev))
+}
+g <- all_models_full_data_cis %>% 
+  mutate(term = fct_relevel(term, all_variables)
+         #term = str_remove(term, "TRUE")
+         ) %>%
+  plot_cis3("Full data", na.rm = TRUE, conversion = pretty_conv_with_effect_alleles) + 
+  labs(x="Odds/hazard/incidence ratio", y="Variable", color="Model") +
+  theme(axis.title.y = element_blank(), plot.title=element_blank(),
+        panel.grid = element_blank(),
+        panel.grid.major.x = element_line(color = "gray", linetype = "dotted")) + 
+  scale_color_discrete(breaks = names(mymodels), labels = unname(mymodels))
+if (save_figs) {
+  filename <- file.path(final_figure_path, "pdf", "all_models_full_data_cis.pdf")
+  ggsave(filename, g, width=180, height=250, unit="mm", title="All models full data")
+}
+g
+```
+
+#### Presentation
+
+
+
+```{r}
+g_non_genetic <- all_models_full_data_cis %>%
+  filter(term %in% non_genetic_variables) %>%
+  mutate(term = fct_relevel(term, non_genetic_variables)) %>%
+  plot_cis3("Full data", na.rm = TRUE) + 
+  labs(x="Odds/hazard/incidence ratio", y="Variable", color="Model") +
+  theme(axis.title.y = element_blank(), plot.title=element_blank(),
+        panel.grid = element_blank(),
+        panel.grid.major.x = element_line(color = "gray", linetype = "dotted")) + 
+  scale_color_discrete(breaks = names(mymodels), labels = unname(mymodels))
+if (save_figs) {
+  filename <- file.path(result_path, "presentation", "pdf", "forest_non_genetic_variables.pdf")
+  ggsave(filename, g_non_genetic, width=180, height=100, unit="mm", title="All models full data")
+}
+g_non_genetic
+```
+
+```{r}
+g_genetic <- all_models_full_data_cis %>%
+  filter(term %in% genetic_variables) %>%
+  mutate(term = fct_relevel(term, genetic_variables)) %>%
+  plot_cis3("Full data", na.rm = TRUE, only_significant = TRUE) + 
+  labs(x="Odds/hazard/incidence ratio", y="Variable", color="Model") +
+  theme(axis.title.y = element_blank(), plot.title=element_blank(),
+        panel.grid = element_blank(),
+        panel.grid.major.x = element_line(color = "gray", linetype = "dotted")) + 
+  scale_color_discrete(breaks = names(mymodels), labels = unname(mymodels))
+if (save_figs) {
+  filename <- file.path(result_path, "presentation", "pdf", "forest_genetic_variables.pdf")
+  ggsave(filename, g_genetic, width=180, height=100, unit="mm", title="All models full data")
+}
+g_genetic
+```
+
+## Table 1
+
+### Compute table 1 in FinnGen
+
+## Table 1
+
+Read baseline age.
+
+```{r}
+if (release == "r12") {
+  filename <- "/finngen/library-red/finngen_R12/analysis_covariates/R12_COV_V2.FID.txt.gz"
+} else {
+  filename <- "/finngen/library-red/finngen_R13/analysis_covariates/data/R13_COV_V0.FID.txt.gz"
+}
+BL_AGE <- read_tsv(filename, col_select = c("FID", "BL_AGE")) %>%
+  rename(sample=FID)
+```
+
+Read venesection data.
+
+```{r}
+filename <- file.path(result_path, "progression", "full_data.rds")
+venesection <- readRDS(filename)
+```
+
+Read rest of the data.
+
+```{r}
+filename <- file.path(result_path, "basic.rds")
+basic <- readRDS(filename)
+```
+
+Create table 1.
+
+```{r}
+genetic_variables <- c("C282Y", "H63D", "S65C", "H1_2",
+                       "credible1", "credible2", "credible3", "rs114179634", "rs3094093", "supersnip")
+vars <- c("hemochromatosis", "sex", "blood_donor", "BL_AGE", "diagnosis_age", "donations_in_five_years", "venesections", 
+          genetic_variables)
+renamer <- function(x) { coalesce(pretty_conv[x], x) %>% unname()}
+tmp <- basic %>% 
+  select(-starts_with("int")) %>%
+  left_join(BL_AGE, by="sample") %>%
+  left_join(venesection %>% select(sample, venesections=n), by="sample") %>%
+  mutate(diagnosis_age = if_else(hemochromatosis == "case", event_age, NA),
+         donations_in_five_years = na_if(donations_in_five_years, 0),
+         venesections = na_if(venesections, 0)) %>%
+  mutate(across(starts_with("credible"), 
+                function(v) { v %>% round() %>% as.factor() %>% fct_collapse(v, dominant=c("1", "2")) } )) %>%
+  rename_with(renamer)
+```
+
+```{r}
+continuous_variables <- c("Baseline age", "Diagnosis age", "Donations in five previous years", "Venesections")
+tmp %>% 
+  select(sample, Sex, all_of(continuous_variables)) %>%
+  pivot_longer(cols = all_of(continuous_variables)) %>%
+  ggplot(aes(value)) + 
+  geom_histogram() + 
+  ggh4x::facet_grid2(Sex ~ name, scales="free", independent = TRUE)
+```
+
+None of the continuous variables is really normal.
+
+```{r}
+tableone <- tableone::CreateTableOne(vars = vars %>% map_chr(renamer), 
+                                     strata = c("Sex"), 
+                                     data = tmp,
+                                     factorVars = c("Hemochromatosis", genetic_variables) %>% map_chr(renamer),
+                                     addOverall = TRUE)
+#rm(tmp)
+## Save to a TSV file
+if (save_tables) {
+  filename <- file.path(table_path, "tableone_finngen.tsv")
+  tableone_matrix <- print(tableone, 
+                           quote = FALSE, noSpaces = TRUE, printToggle = FALSE,
+                           nonnormal = continuous_variables,
+                           formatOptions = list(scientific = FALSE, big.mark = ","))   # The thousand separator does not work
+  write_tsv(tableone_matrix %>% as_tibble(rownames = "rownames"), file = filename)
+}
+print(tableone, #quote = FALSE, #noSpaces = TRUE,
+                           nonnormal = continuous_variables,
+                           formatOptions = list(big.mark = ","))   # For some reason this only works for the "n" row
+#tableone
+```
+
+Try the gtsummary package instead. It can format numbers better and show missing values.
+
+```{r}
+mygt <- tmp %>% 
+  tbl_summary(include = vars %>% map_chr(renamer),
+              by = Sex,
+              type = all_continuous() ~ "continuous2",
+              statistic = all_continuous() ~ c(
+                "{N_nonmiss}",
+                "{median} ({p25}, {p75})"),
+              missing = "no") %>%
+  add_overall()
+if (save_tables) {
+  filename <- file.path(table_path, "gtableone_finngen.tsv")
+  mygt %>% as_tibble() %>% 
+    #mutate(across(everything(), stringi::stri_escape_unicode)) %>%   # escape newline characters, but there are none in columns
+    rename_with(stringi::stri_escape_unicode) %>%                    # They are in the column names instead.
+    write_tsv(file = filename)
+  # How to save to xslx files:
+  # https://www.pipinghotdata.com/posts/2024-07-26-gtsummary-to-excel/
+  xlsx_filename <- file.path(table_path, "gtableone_finngen.xslx")
+  mygt %>% as_hux_xlsx(file = xlsx_filename)
+}
+mygt
+```
+
+```{r}
+tmp %>% select(all_of(continuous_variables)) %>% summary()
+```
+
+How many non-NA values?
+
+```{r}
+tmp %>% select(all_of(continuous_variables)) %>% summarise(across(everything(), function(v) sum(!is.na(v))))
+```
+
+### Combine the tables
+
+```{r}
+tableone_finngen <- read_tsv(file.path(table_path, "tableone_finngen.tsv"))
+tableone_ukbb <- read_tsv(file.path(table_path, "tableone_ukbb.tsv"))
+```
+
+This does not work. I have to join it by hand in Libre Office.
+
+```{r}
+left_join(
+  tableone_finngen %>% select(-c(p, test)),
+  tableone_ukbb %>% select(-c(p, test)),
+  by="rownames",
+  suffix=c("_finngen", "_ukbb")
+)
+```
+
+## Exclusions
+
+Exclusions in FinnGen.
+
+This information is extracted from the sandbox file
+/finngen/library-green/finngen_R12/finngen_R12_analysis_documentation/finngen_R12_analysis_document_GWAS.pdf
+
+```{r}
+exclusions_finngen <- tribble(
+  ~name, ~count, ~diff_count,
+  "Original data", 520210, NA,
+  "Non-Finnish/ twins / duplicates", 500737, 19473,
+  "missing covariates", 500382, 355,
+  "mismatching sex", 500348, 34,
+  "metabolic diseases", 420543, 79805
+)
+exclusions_finngen
+```
+
+```{r}
+exclude::plot_flow(exclusions_finngen) %>% DiagrammeR::grViz()
+```
+
+Save to file.
+
+```{r}
+filename <- file.path(final_figure_path, "svg", "exclusions_finngen.svg")
+exclusions_finngen %>%
+  exclude::plot_flow() %>% 
+  DiagrammeR::grViz() %>% 
+  DiagrammeRsvg::export_svg() %>% 
+  cat(file = filename)
+```
+
+
+NA in principal components: excluded count=0, remaining count=502,547
+
+Non-caucasian: excluded count=93,033, remaining count=409,514
+
+snips not available: excluded count=731, remaining count=408,783
+
+Drop persons with all covariate information missing: excluded count=0, remaining count=408,783
+
+Exclusions in UKBB.
+
+```{r}
+# exclusions_ukbb <- tribble(
+#   ~name, ~count, ~diff_count,
+#   "Original data", 502547, NA,
+#   "NA in principal components", 502547, 0,
+#   "Non-caucasian", 409514, 93033,
+#   "SNPs not available", 408783, 731,
+#   "covariate information missing", 408783, 0
+# )
+# exclusions_ukbb
+```
+
+```{r}
+filename <- file.path(table_path, "ukbb_exclusions.tsv")
+exclusions_ukbb <- read_tsv(filename)
+exclusions_ukbb <- exclusions_ukbb %>% filter(diff_count > 0 | is.na(diff_count))
+```
+
+```{r}
+exclusions_ukbb %>% exclude::plot_flow() %>% DiagrammeR::grViz()
+```
+
+
+```{r}
+filename <- file.path(final_figure_path, "svg", "exclusions_ukbb.svg")
+exclusions_ukbb %>%
+  exclude::plot_flow() %>% 
+  DiagrammeR::grViz() %>% 
+  DiagrammeRsvg::export_svg() %>% 
+  cat(file = filename)
+```
+
+## Snip table
+
+```{r}
+filename <- "/finngen/library-green/finngen_R12/finngen_R12_analysis_data/annotations/R12_annotated_variants_v1.small.gz"
+annotation <- read_tsv(filename)
+```
+
+```{r}
+filename <- file.path(result_path, "all_snip_info.tsv")
+all_snip_info <- read_tsv(filename)
+all_snip_info <- all_snip_info %>% mutate(`#variant` = sprintf("%i:%i:%s:%s", chromosome, pos_hg38, ref, alt))
+tmp <- all_snip_info %>% inner_join(annotation, by=c("#variant", "rsid", "ref", "alt"))
+conv <- c(name = "name", rsid = "rsid", chromosome = "chromosome", pos_hg38 = "pos_hg38", pos_hg19 = "pos_hg19", 
+          "Non-effect allele" = "ref", "Effect allele" = "alt", "Effect allele frequency" = "AF", 
+          "variant type" = "most_severe", "gene" = "gene_most_severe", enrichment = "GENOME_enrichment_nfee")
+snip_table <- tmp %>% rename(pos_hg19 = b37_coord) %>% select(-"#variant") %>% 
+  mutate(pos_hg19 = str_split_i(pos_hg19, ":", 2) %>% as.numeric(),
+         most_severe = str_replace_all(most_severe, "_", " "),
+         name = case_when(
+           name == "supersnip" ~ "HLA3",
+           name == "credible1" ~ "Causal1",
+           name == "credible2" ~ "Causal2",
+           name == "credible3" ~ "Causal3",
+           TRUE                ~ name
+         )) %>% 
+  replace_na(list(pos_hg19 = 32604152)) %>%   # For some reason the position of supersnip is not available in all 
+  select(!!!conv)     %>%                     # snip databases
+  arrange(pos_hg38)
+snip_table
+```
+
+```{r}
+filename <- file.path(final_table_path, "snip_table.tsv")
+write_tsv(snip_table, filename)
+```
+
+## Snip figure
+
+```{r}
+# Set global theme
+theme_set(theme_gray(base_size = 7.5) + theme(panel.grid.major.x=element_blank(), panel.grid.minor.x=element_blank()))
+```
+
+Prevalences
+
+```{r}
+filename <- file.path(table_path, "fg_prevalences.tsv")
+fg_prevalences <- read_tsv(filename) %>% 
+  mutate(label = stringi::stri_unescape_unicode(label))  %>%
+  filter(blood_donor == "all") %>%
+  select(-blood_donor)
+filename <- file.path(table_path, "ukbb_prevalences.tsv")
+ukbb_prevalences <- read_tsv(filename) %>% mutate(label = stringi::stri_unescape_unicode(label))
+```
+
+```{r}
+filename <- file.path(table_path, "fg_mafs_by_status.tsv")
+fg_mafs <- read_tsv(filename, show_col_types = FALSE)
+filename <- file.path(table_path, "ukbb_mafs_by_status.tsv")
+ukbb_mafs <- read_tsv(filename, show_col_types = FALSE)
+ukbb_mafs <- ukbb_mafs %>% mutate(name = if_else(name == "rs181949568", "credible1", name))
+mafs <- bind_rows(fg=fg_mafs, ukbb=ukbb_mafs, .id="cohort")
+
+mafs <- add_missing_combinations(mafs, cohort, name, hemochromatosis)# %>% 
+  #replace_na(list(minor_allele_count=0, minor_allele_freq=0))
+```
+
+```{r}
+filename <- file.path(table_path, "fg_dosage_maf.tsv")
+fg_dosage <- read_tsv(filename)
+filename <- file.path(table_path, "ukbb_dosage_maf.tsv")
+ukbb_dosage <- read_tsv(filename)
+ukbb_dosage <- ukbb_dosage %>% rename(observed_freq = fraction, observed_count = n) # Need to fix ukbb analysis to use better names
+ukbb_dosage <- ukbb_dosage %>% mutate(name = if_else(name == "rs181949568", "credible1", name))
+dosage <- bind_rows(fg=fg_dosage, ukbb=ukbb_dosage, .id="cohort")
+dosage <- dosage %>%
+  filter(name != "rs9261354") %>% # This was excluded due to high VIF
+  mutate(name = coalesce(pretty_conv[name], name),
+         name = str_remove(name, " \\(.*\\)"))
+```
+
+```{r}
+filename <- file.path(table_path, "fg_combinations_C282Y_H63D.tsv")
+fg_combinations <- read_tsv(filename) %>% mutate(label = stringi::stri_unescape_unicode(label))
+filename <- file.path(table_path, "ukbb_combinations_C282Y_H63D.tsv")
+ukbb_combinations <- read_tsv(filename) %>% mutate(label = stringi::stri_unescape_unicode(label))
+combinations <- bind_rows(fg=fg_combinations, ukbb=ukbb_combinations, .id="cohort")
+```
+
+### Prevalences
+
+```{r}
+g0 <- bind_rows(fg=fg_prevalences, 
+          ukbb=ukbb_prevalences %>% mutate(label = str_remove(label, "^cases=")), 
+          .id="cohort") %>%
+  mutate(cohort = fct_recode(cohort, FinnGen="fg", UKBB="ukbb")) %>%
+  ggplot(aes(sex, n, fill=cohort)) + 
+  geom_col(position=position_dodge()) + 
+  geom_text(aes(label=label), position=position_dodge(width=1)) +
+  scale_y_continuous(expand=expansion(mult=.1)) +
+  labs(x="Sex", y="Hemochromatosis cases", fill="Cohort") 
+g0
+```
+
+### MAF
+
+```{r}
+g1 <- mafs %>%
+  filter(name != "rs9261354") %>% # This was excluded due to high VIF
+  #mutate(name = fct_recode(name, HLA3="supersnip")) %>%
+  #mutate(name = fct_relabel(name, prettify)) %>%
+  mutate(name = coalesce(pretty_conv[name], name),
+         name = str_remove(name, " \\(.*\\)")) %>%    # Remove the rsid in the parentheses
+  mutate(cohort = fct_recode(cohort, FinnGen="fg", UKBB="ukbb")) %>%
+  ggplot(aes(name, minor_allele_freq, fill=cohort)) + 
+  geom_col(position="dodge", na.rm=TRUE) +
+  scale_y_continuous(labels=scales::label_percent()) +
+  labs(x="SNP", y="Minor allele frequency", fill="Cohort") +
+  facet_wrap(~hemochromatosis) +
+  theme(axis.text.x = element_text(angle = 45, hjust=1, vjust=1))
+g1
+```
+
+### Dosages
+
+```{r}
+hwes <- dosage %>% select(cohort, name, hemochromatosis, label, color) %>% 
+  filter(hemochromatosis == "case") %>%
+  distinct() %>%
+  mutate(y = if_else(cohort == "fg", 0.96, 0.90),    # Vertical position of the HWE labels
+         cohort = fct_recode(cohort, FinnGen="fg", UKBB="ukbb"),
+         fontface = if_else(color=="red", "bold.italic", "plain"))   # Is the HWE test significant
+hwes <- add_missing_combinations(hwes, cohort, name, hemochromatosis)
+dosage2 <- add_missing_combinations(dosage, cohort, name, hemochromatosis, dosage)
+g2 <- dosage2 %>%
+  filter(hemochromatosis == "case") %>%
+  mutate(cohort = fct_recode(cohort, FinnGen="fg", UKBB="ukbb")) %>%
+  ggplot(aes(dosage, observed_freq, fill=cohort)) + 
+  geom_col(position="dodge", na.rm = TRUE) + 
+  geom_point(#data = expected_dosages, 
+             aes(dosage, expected_freq), color="red", position=position_dodge(width=1),
+             show.legend = FALSE) + 
+  geom_text(aes(label=observed_count), vjust=0.5, hjust=0, position=position_dodge(width=1), angle=90, na.rm = TRUE) +
+  geom_text(data=hwes, mapping=aes(x=I(0.5), y=I(y), label = label, color=cohort, fontface=fontface), 
+            na.rm = TRUE, show.legend = FALSE, hjust=0.5) +
+  scale_y_continuous(labels=scales::label_percent(), limits=c(0, 1.1), 
+                     breaks=c(0, 0.25, 0.5, 0.75, 1),
+                     minor_breaks=seq(0, 1, 0.125),   # Don't show grid lines above 100% level
+                     name="Percentage", expand = expansion(mult=c(0.05, 0.3))) +
+  labs(x="Alternative allele dosage", fill="Cohort") + #, subtitle="Red point is expected frequency due to MAF") + 
+  #lims(y=c(0, 100)) +
+  facet_grid( ~ name, labeller = my_as_labeller(c(supersnip = "HLA3"))) 
+  #facet_grid( ~ name, labeller = mylabeller) 
+g2
+```
+
+### Combinations
+
+```{r}
+snip1 <- "C282Y"
+snip2 <- "H63D"
+heatmap_text_size <- 2.2
+create_heatmap <- function(df, snip1, snip3) {
+  g <- df %>%
+    ggplot(aes(x=.data[[snip1]], y=.data[[snip2]], fill=freq)) + 
+    geom_raster() + 
+    geom_text(aes(label=label), color="white", size=heatmap_text_size) +
+    scale_fill_continuous(labels=scales::label_percent(), name="Frequency", lim=c(0, 0.75)) +
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank()) +
+    scale_x_continuous(expand = expansion(add=0), breaks=c(0, 1, 2)) +
+    scale_y_continuous(expand = expansion(add=0), breaks=c(0, 1, 2)) +
+    #labs(title="Dosage combinations", subtitle=correlations) +
+    facet_grid(~ hemochromatosis)
+  g  
+}
+```
+
+
+```{r}
+g3 <- create_heatmap(fg_combinations, snip1, snip2)
+g3
+```
+
+```{r}
+g4 <- create_heatmap(ukbb_combinations, snip1, snip2)
+g4
+```
+
+### Full figure
+
+```{r, fig.width=7, fig.height=5.5}
+# Set default aesthetic for geom_point. Affects the red dots
+update_geom_defaults("point", aes(size = 0.5))   # Default size was originally 1.5 mm
+# Set default aesthetic for geom_text
+update_geom_defaults("text", aes(size = 2))   # Default size was originally 3.88 mm
+# snip_g <- (g0 + g1 + g2 + plot_layout(widths = c(1, 2, 2))) / (g3 + g4) + 
+#   plot_annotation(tag_levels = "A") + 
+#   plot_layout(guides = "collect")
+snip_g <- (g0 + g1 + plot_layout(widths = c(1, 2))) / g2 / (g3 + g4) + 
+  plot_annotation(tag_levels = "A") + 
+  plot_layout(guides = "collect") & theme(legend.key.size = unit(0.8, "line"))
+#  + plot_layout(axes = "collect_y",)
+filename <- file.path(final_figure_path, "pdf", "snip_figure.pdf")
+if (save_figs)
+  ggsave(filename, snip_g, width=180, height=140, units="mm", title="SNP figure")
+snip_g
+```
+
+## Performance figure
+
+```{r}
+filename <- sprintf("%s/all_performances.tsv", table_path)
+all_performances <- read_tsv(filename)
+```
+
+```{r}
+method_order <- c("train", "cv", "test")
+new_names <- tibble::tribble(
+              ~id,        ~name2,
+  "logistic_lf_0", "Baseline (Logistic)",
+  "logistic_lf_6", "Comparison (Logistic)",
+  "logistic_lf_5", "Best FinnGen (Logistic)",
+       "xg_fit_5", "Best FinnGen (XGBoost)",
+       "xg_fit_7", "All interactions (XGBoost)"
+  )
+
+all_performances2 <- all_performances %>%
+  filter(.metric %in% c("roc_auc", "pr_auc")) %>%
+  filter(id %in% c("logistic_lf_0", "logistic_lf_5", "logistic_lf_6", "xg_fit_5", "xg_fit_7")) %>%
+  drop_na(.estimate) %>%
+  inner_join(new_names, by="id") %>%
+  mutate(.metric = case_when(.metric == "pr_auc" ~ "Area under PR curve", .metric == "roc_auc" ~ "Area under ROC curve")) %>% 
+  mutate(name2 = factor(name2, levels = new_names$name2),
+         method = factor(method, levels = method_order)) %>%
+  mutate(across(c(name2, method), fct_rev))
+```
+
+
+```{r}
+performance_plot <- function(df, size=0.5, base_size=11) {
+  g <- df %>%
+    ggplot(aes(x=.estimate, y=name2, color=method, xmin=low, xmax=high)) + 
+    geom_stripes(df, "name2") + 
+    geom_linerange(position = position_dodge(width=0.5), na.rm=TRUE, linewidth = size) + 
+    geom_point(position = position_dodge(width=0.5), size = size + 0.3) + 
+    scale_color_discrete(breaks = method_order) +
+    facet_wrap(~.metric) +
+    labs(x="Estimate", y="Model", color="Method") + # , title="Performances") + #, subtitle="With confidence intervals") +
+    lims(x=0:1) +
+    theme_gray(base_size = base_size) +
+    theme(legend.position = "bottom",
+          panel.grid = element_blank(),
+          panel.grid.major.x = element_line(color = "gray", linetype = "dotted"))
+  g
+}
+```
+
+
+```{r}
+g <- performance_plot(all_performances2)
+if (save_figs) {
+  filename <- file.path(final_figure_path, "pdf", "performance.pdf")
+  ggsave(filename, g, width=180, height=90, units="mm", title="Performance")
+}
+if (save_figs) {
+  filename <- file.path(result_path, "presentation", "pdf", "performance.pdf")
+  g2 <- performance_plot(all_performances2, size=1, base_size = 12)
+  ggsave(filename, g2, width=180, height=90, units="mm", title="Performance")
+}
+g
+```
+
+## Performance curves
+
+```{r}
+filename <- sprintf("%s/roc_data.tsv.gz", table_path)
+roc_data <- read_tsv(filename)
+filename <- sprintf("%s/pr_data.tsv.gz", table_path)
+pr_data <- read_tsv(filename)
+```
+
+ROC curves.
+
+```{r}
+g_roc <- roc_data %>%
+  filter(id2 %in% new_names$id) %>%
+  mutate(name = factor(id2, levels=new_names$id, labels=new_names$name2)) %>%
+  mutate(method = factor(method, levels=method_order)) %>%
+  ggplot(aes(1-specificity, sensitivity, color=name)) +
+  geom_line() +
+  labs(color="Model") +
+  facet_grid(~ method)
+g_roc
+```
+
+PR curves.
+
+```{r}
+g_pr <- pr_data %>%
+  filter(id2 %in% new_names$id) %>%
+  mutate(name = factor(id2, levels=new_names$id, labels=new_names$name2)) %>%
+  mutate(method = factor(method, levels=method_order)) %>%
+  ggplot(aes(recall, precision, color=name)) +
+  geom_line() +
+  labs(color="Model") +
+  facet_grid(~ method)
+g_pr
+```
+
+```{r}
+g <- g_roc / g_pr +
+  plot_annotation(tag_levels = "A") + 
+  plot_layout(guides = "collect") #& theme(legend.key.size = unit(0.8, "line"))
+#  + plot_layout(axes = "collect_y",)
+if (save_figs)
+  filename <- file.path(final_figure_path, "pdf", "performance_curves.pdf")
+  ggsave(filename, g, width=180, height=140, units="mm", title="Performance curves")
+g
+```
+
+## Regenie interactions
+
+```{r}
+filename <- file.path(table_path, "regenie_interaction.txt.gz")
+regenie_interaction <- read_delim(filename, delim=" ")
+regenie_interaction_filtered <- regenie_interaction %>% filter(LOG10P >= -log10(0.05))   # Coarse filtering to produce a smaller data set
+nrow(regenie_interaction_filtered)
+```
+
+```{r}
+filename <- file.path(table_path, "regenie_adjusted_interaction.txt.gz")
+regenie_adjusted_interaction <- read_delim(filename, delim=" ")
+regenie_adjusted_interaction_filtered <- regenie_adjusted_interaction %>% filter(LOG10P >= -log10(0.05))   # Coarse filtering to produce a smaller data set
+nrow(regenie_adjusted_interaction_filtered)
+```
+
+```{r}
+significance_level <- -log10(5e-8 / 6)    # Regenie performs six tests
+```
+
+```{r}
+tmp <- bind_rows(unadjusted = regenie_interaction_filtered, 
+                 adjusted = regenie_adjusted_interaction_filtered,
+                 .id = "gwas") %>% 
+  filter(TEST == "ADD-INT_SNPxchr6_26092913_G_A") %>%
+  mutate(gwas = factor(gwas, levels=c("unadjusted", "adjusted")))
+g <- tmp %>% 
+  #mutate(TEST = str_replace(TEST, "chr6_26092913_G_A", "C282Y")) %>%   # Shorter name
+  ggplot(aes(x=GENPOS, y=LOG10P)) + 
+  geom_point() + 
+  geom_hline(yintercept = significance_level, color="red") +
+  labs(x="Position", y=bquote(-log[10](italic(p)))) +
+  scale_x_continuous(labels = scales::label_number(scale_cut = scales::cut_short_scale(), suffix="b")) +
+  facet_wrap(~ gwas, scales = "free_x")
+if (save_figs) {
+  filename <- file.path(final_figure_path, "pdf", "regenie_interaction.pdf")
+  ggsave(filename, g, width = 180, height = 114, units = "mm")
+}
+g
+```
+
+Save the significant snips to a table.
+
+```{r}
+conv <- c(gwas = "gwas", chromosome = "CHROM", position = "GENPOS", id = "ID", "Non-effect allele" = "ALLELE0", 
+          "Effect allele" = "ALLELE1", "Effect allele frequency" = "A1FREQ", "Effect allele frequency in cases" = "A1FREQ_CASES",
+          "Effect allele frequency in controls" = "A1FREQ_CONTROLS", info = "INFO", n = "N", "n cases" = "N_CASES", 
+          "n controls" = "N_CONTROLS", beta = "BETA", se = "SE", chisq = "CHISQ", mlog10p = "LOG10P")
+regenie_interaction_significant <- tmp %>% 
+  filter(LOG10P >= significance_level) %>%
+  select(-c(TEST, EXTRA)) %>%
+  rename(!!!conv)
+```
+
+```{r}
+filename <- file.path(final_table_path, "regenie_interaction_significant.tsv")
+write_tsv(regenie_interaction_significant, filename)
+```
+
+## HLA GWAS
+
+```{r}
+# Split the ID column into gene and allele parts
+cleanup <- function(results, hla_order) {
+  df <- results %>% 
+    separate_wider_delim(col=ID, delim="*", names = c("gene", "allele")) %>%
+    mutate(gene = factor(gene, levels=hla_order)) %>%
+    droplevels()
+  df
+}
+# Order from Degenhardt (2019)
+hla_order <- c("F", "G", "A", "E", "C", "B", "MICA", "MICB", "DRB3", "DRB5", "DRB4", "DRB1", "DQA1", "DQB1", "DPB1")
+```
+
+```{r}
+# Unadjusted
+filename <- file.path(table_path, "train_E4_IRON_MET.hla.regenie.gz")
+results <- read_delim(filename, delim=" ")
+results <- cleanup(results, hla_order)
+# Adjusted
+filename <- file.path(table_path, "train_E4_IRON_MET.C282Y_adjusted_hla.regenie.gz")
+results_C282Y_adjusted <- read_delim(filename, delim=" ")
+results_C282Y_adjusted <- cleanup(results_C282Y_adjusted, hla_order)
+```
+
+```{r}
+hla_gwas <- bind_rows(unadjusted = results, adjusted = results_C282Y_adjusted, .id="gwas") %>%
+  mutate(gwas = factor(gwas, levels=c("unadjusted", "adjusted"))) %>%
+  select(-c(TEST, EXTRA))
+
+significance_level <- -log10(0.05 / nrow(results))
+to_annotate <- hla_gwas %>% filter(LOG10P > significance_level)
+g <- hla_gwas %>% 
+  mutate(color = factor(case_when(
+    BETA > 0 ~ "red",
+    BETA < 0 ~ "blue",
+    TRUE  ~ "black"
+  ), levels=c("blue", "black", "red"))) %>%
+  ggplot(aes(x=as.integer(gene)-0.25, y=LOG10P, color=color)) + 
+  geom_hline(yintercept = significance_level, linetype="dotted") +
+  geom_segment(aes(xend = as.integer(gene)+0.25), alpha=0.5) +
+  geom_text_repel(data=to_annotate, mapping=aes(x=as.integer(gene)+0.3, y=LOG10P, label=allele), 
+                  box.padding=0, force=0.5, force_pull = 100, hjust=0, vjust=0.5, direction="y", size=2.4, inherit.aes = FALSE) +
+  #geom_text(data=to_annotate, mapping=aes(x=as.integer(gene)+0.3, y=LOG10P, label=allele), hjust=0, 
+  #          position=position_jitter(width=0), direction="y", size=2.5) +
+  scale_x_continuous(breaks = 1:length(levels(hla_gwas$gene)), labels = levels(hla_gwas$gene)) +
+  #scale_y_log10() +
+  scale_discrete_identity(guide = "legend",
+                          aesthetics = "color",
+                          name = "Effect",
+                          drop = FALSE,
+                          labels = c("risk",   #"zero", 
+                                     "protective"),
+                          #values = c("red", "black", "blue"),
+                          breaks = c("red", #"black", 
+                                     "blue")) +
+  labs(x="Gene", y=expression(-log[10](p)), color="Effect") +
+  facet_grid(gwas ~ .) + 
+  theme_gray(base_size = 7.5) + 
+  theme(panel.grid.major.x=element_blank(), panel.grid.minor.x=element_blank())
+if (save_figs) {
+  filename <- file.path(final_figure_path, "pdf", "hla_gwas.pdf")
+  ggsave(filename, g, width = 180, height = 130, units = "mm")
+}
+g
+```
+
+For genes F, G, E, MICA and MICB the effect allele is marked with "<present>". So, maybe imputation was done
+differently for non-classical genes.
+
+Should I try to fix this here? Done.
+
+```{r}
+conv <- c(gwas = "gwas", chromosome = "CHROM", position = "GENPOS", gene = "gene", 
+          allele = "allele", 
+          `Non-effect allele` = "ALLELE0", `Effect allele` = "ALLELE1", 
+          `Effect allele frequency` = "A1FREQ", 
+          `Effect allele frequency in cases` = "A1FREQ_CASES", 
+          `Effect allele frequency in controls` = "A1FREQ_CONTROLS", 
+          info = "INFO", n = "N", 
+          beta = "BETA", se = "SE", chiqs = "CHISQ", mlog10p = "LOG10P")
+hla_gwas_cleaned <- hla_gwas %>% 
+  rename(!!!conv) %>%
+  mutate(`Effect allele` = if_else(`Effect allele` == "<present>", 
+                                   paste(gene, allele, sep="*"), 
+                                   `Effect allele`))
+hla_gwas_cleaned
+```
+
+```{r}
+filename <- file.path(final_table_path, "hla_gwas.tsv")
+write_tsv(hla_gwas_cleaned, filename)
+```
+
+## C282Y wild
+
+```{r logistic-cis-5-wild}
+filename <- file.path(table_path, "logistic_cis_5_wild.tsv")
+logistic_cis_5_wild <- read_tsv(filename)
+```
+
+```{r logistic-cis-wild-plot-5}
+#| fig-cap: The age is at first event for cases and at death or EOF for controls.
+g <- plot_cis(logistic_cis_5_wild, "Logistic model 5 wild FinnGen") + labs(y="Variable")
+if (save_figs) {
+  filename <- file.path(final_figure_path, "pdf", "logistic_cis_5_wild.pdf")
+  #ggsave(file.path(figure_path, "poster", "logistic_cis_5_wild.pdf"), 
+  #       g + theme(plot.title=element_blank(), axis.title.y.left = element_blank()))
+  ggsave(filename, g + theme(plot.title=element_blank(), axis.title.y.left = element_blank()), 
+         width = 180, height = 130, units = "mm")
+}
+g
+```
+
+## Correlation plot
+
+```{r}
+filename <- file.path(table_path, "ld_among_all.tsv")
+hla_pearson <- read_tsv(filename)
+```
+
+```{r}
+hla_pearson2 <- hla_pearson %>%
+  mutate(x = prettify(x), y = prettify(y)) %>%
+  mutate(across(c(x, y), function(x) str_remove(x, " \\(.*\\)")))    # Remove the rsid in the parentheses
+g <- plot_correlation(hla_pearson2, size=2.7) +
+  theme(axis.text.x = element_text(angle = 45, hjust=1),
+        plot.title = element_blank())
+if (save_figs) {
+  filename <- file.path(final_figure_path, "pdf", "ld_among_all.pdf")
+  ggsave(filename, g, width=180, height=180, unit="mm")
+}
+g
+```
+
+## Variable importances
+
+```{r}
+filename <- file.path(table_path, "xg_importance_5.tsv")
+xg_importance_5 <- read_tsv(filename)
+filename <- file.path(table_path, "xg_importance_7.tsv")
+xg_importance_7 <- read_tsv(filename)
+```
+
+```{r}
+plot_importances <- function(importances) {
+  importances %>%
+    filter(value > 0) %>%
+    mutate(name = fct_relabel(name, make_prettify_function(pretty_conv))) %>%
+    mutate(name = fct_reorder(name, value)) %>%
+    ggplot(aes(name, value)) +
+    geom_col() +
+    labs(y="mean(|SHAP value|)") +
+    coord_flip()+
+    theme(axis.title.y = element_blank()
+          #panel.grid = element_blank()
+    )
+}
+```
+
+
+```{r}
+g <- plot_importances(xg_importance_5)
+if (save_figs) {
+  filename <- file.path(final_figure_path, "pdf", "xg_importances_5.pdf")
+  ggsave(filename, g, width = 180, height = 130, units = "mm")
+}
+g
+```
+
+```{r}
+g <- plot_importances(xg_importance_7)
+if (save_figs) {
+  filename <- file.path(final_figure_path, "pdf", "xg_importances_7.pdf")
+  ggsave(filename, g, width = 180, height = 130, units = "mm")
+}
+g
+```
+
+## Effect sizes of predictor combinations
+
+```{r}
+filename <- file.path(table_path, "cis_dosage_combinations.tsv")
+if (! file.exists(filename) || recompute) {
+  model_filename <- file.path(model_path, "logistic_full_5.rds")
+  logistic_full_5 <- readRDS(model_filename)
+  fit <- logistic_full_5 %>% extract_fit_engine()
+  
+  # The columns C282Y and H63D are not really needed in the below tibble
+  df <-  tribble(
+    ~C282Y, ~H63D, ~`variables`,
+    0, 0, c(),
+    0, 1, c("H63D_X1"),
+    0, 2, c("H63D_X2"),
+    1, 0, c("C282Y_X1"),
+    1, 1, c("C282Y_X1", "H63D_X1", "C282Y_X1_x_H63D_X1"),
+    1, 2, c("C282Y_X1", "H63D_X2", "C282Y_X1_x_H63D_X2"),
+    2, 0, c("C282Y_X2"),
+    2, 1, c("C282Y_X2", "H63D_X1", "C282Y_X2_x_H63D_X1"),
+    2, 2, c("C282Y_X2", "H63D_X2", "C282Y_X2_x_H63D_X2"),
+  )
+  #summarise(C282Y, H63D, get_odds_ratios(fit, variables, exponentiate = TRUE))
+  cis <- get_odds_ratio_sums(fit, df, exponentiate=TRUE)
+  cis <- cis %>% 
+    mutate(name = glue("C282Y={C282Y} H63D={H63D}"))
+  write_tsv(cis, filename)
+} else {
+  cis <- read_tsv(filename)
+}
+g <- cis %>% 
+  mutate(name = fct_rev(name)) %>%
+  ggplot(aes(x=estimate, y = name, xmin = conf.low, xmax = conf.high)) +
+  geom_vline(xintercept = 1, color="gray") +
+  geom_point() +
+  geom_linerange() +
+  scale_x_log10() +
+  labs(x="Odds ratio", y="Dosage combination")
+if (save_figs) {
+  filename <- file.path(figure_path, "cis_dosage_combinations.pdf")
+  ggsave(filename, g, width = 180, height = 90, units = "mm")
+}
+g
+```
+
+## Alternative models
+
+### Comparison model
+
+```{r}
+filename <- file.path(table_path, "logistic_cis_alternative_full_6.tsv")
+logistic_cis_alternative_full_6 <- read_tsv(filename)
+logistic_cis_alternative_full_6 <- logistic_cis_alternative_full_6 %>%
+  mutate(term = reverse_interactions(term))
+
+filename <- file.path(table_path, "firth_cis_alternative_full_6.tsv")
+firth_cis_alternative_full_6 <- read_tsv(filename)
+firth_cis_alternative_full_6 <- firth_cis_alternative_full_6 %>%
+  mutate(term = reverse_interactions(term))
+```
+
+```{r}
+cis_alternative_full_6 <- bind_rows(
+  normal = fg_logistic_cis_full_6, 
+  alternative = logistic_cis_alternative_full_6 %>% filter(! (conf.high > 1e20 | conf.low < 1e-20)),
+  alternative_firth = firth_cis_alternative_full_6,
+  .id="model")
+g <- cis_alternative_full_6 %>%
+  # Filter out variables whose confidence intervals were really large
+  #filter(! (conf.high > 1e20 | conf.low < 1e-20)) %>%
+  mutate(term = fct_relevel(term, all_variables)) %>%
+  mutate(model = factor(model, levels=c("normal", "alternative", "alternative_firth"))) %>%
+  mutate(model = fct_rev(model)) %>%
+  plot_cis3("Logistic model 6 alternative full FinnGen") + 
+  # Apparently the guides() call in plot_cis3 is discarded is another call is found. Hence, I override the shape again
+  guides(color = guide_legend(reverse=TRUE, override.aes = list(shape = 16))) + 
+  theme(axis.title.y = element_blank(), plot.title=element_blank(),
+        panel.grid = element_blank())
+if (save_figs) {
+  filename <- file.path(final_figure_path, "pdf", "logistic_cis_sensitivity_full_6.pdf")
+  ggsave(filename, g, width=7, height=7, title = "logistic_cis_sensitivity_full_6")
+}
+g
+```
+
+
+### Best FinnGen model
+
+```{r}
+filename <- file.path(table_path, "logistic_cis_alternative_full_5.tsv")
+logistic_cis_alternative_full_5 <- read_tsv(filename)
+logistic_cis_alternative_full_5 <- logistic_cis_alternative_full_5 %>%
+  mutate(term = reverse_interactions(term))
+filename <- file.path(table_path, "firth_cis_alternative_full_5.tsv")
+firth_cis_alternative_full_5 <- read_tsv(filename)
+firth_cis_alternative_full_5 <- firth_cis_alternative_full_5 %>%
+  mutate(term = reverse_interactions(term))
+```
+
+```{r}
+cis_alternative_full_5 <- bind_rows(normal=fg_logistic_cis_full_5, 
+               alternative=logistic_cis_alternative_full_5 %>%
+                 # Filter out variables whose confidence intervals were really large
+                  filter(! (conf.high > 1e50 | conf.low < 1e-50)), 
+               alternative_firth = firth_cis_alternative_full_5,
+               .id="model")
+g <- cis_alternative_full_5 %>%
+  mutate(term = fct_relevel(term, all_variables)) %>%
+  mutate(model = factor(model, levels=c("normal", "alternative", "alternative_firth"))) %>%
+  mutate(model = fct_rev(model)) %>%
+  plot_cis3("Logistic model 5 alternative full FinnGen") + 
+  # Apparently the guides() call in plot_cis3 is discarded if another call is found. Hence, I override the shape again
+  guides(color = guide_legend(reverse=TRUE, override.aes = list(shape = 16))) + 
+  theme(axis.title.y = element_blank(), plot.title=element_blank(),
+        panel.grid = element_blank())
+if (save_figs) {
+  filename <- file.path(final_figure_path, "pdf", "logistic_cis_sensitivity_full_5.pdf")
+  ggsave(filename, g, width=7, height=7, title = "logistic_cis_sensitivity_full_5")
+}
+g
+```
+
+### Alternaltive progression model
+
+```{r}
+filename <- file.path(progression_table_path, "cis_zip2_full_window.tsv")
+cis_zip2_full_window <- read_tsv(filename, col_types = cols(term = col_character(), .default = col_double()))
+g <- cis_zip2_full_window %>% 
+  mutate(term = fct_relevel(term, all_variables)) %>%
+  plot_cis("Venesections: count in 2-year window") +
+  theme(axis.title.y = element_blank()) +#, #plot.title=element_blank(),
+        #panel.grid = element_blank())
+  labs(x="Incidence ratio")
+if (save_figs) {
+  filename <- file.path(final_figure_path, "pdf", "cis_zip2_full_window.pdf")
+  ggsave(filename, g, width=7, height=7, title = "cis_zip2_full_window")
+}
+g
+```
+
+## Risk tables
+
+```{r}
+# important_predictors5 <- c(Donations="donations_in_five_years", Sex2="sex2", "H63D", "C282Y", HLA3="supersnip", Causal1="credible1") %>% fill_names()
+# important_predictors6 <- c(Sex="sex", "H63D", "C282Y", HLA3="supersnip") %>% fill_names()
+important_predictors5 <- c(Donations="donations_in_five_years", Sex2="sex2", "H63D", "C282Y", Causal1="credible1") %>% fill_names()
+important_predictors6 <- c(Sex="sex", "H63D", "C282Y") %>% fill_names()
+width  <- 180  # mm
+height <- 100 # mm
+```
+
+### Comparison model
+
+For presentation.
+
+```{r, fig.width=width/25.4, fig.height=height/25.4}
+title <- "Comparison model risk table"
+filename <- file.path(table_path, "risk_table_6_full.tsv")
+risk_table_6_full <- read_tsv(filename, show_col_types = FALSE)  
+                              # The dataframe is a mixture of long and wide forms, since the graph part needs long format,
+                              # and table part needs wide format
+# This is now done inside the plot_risk_table
+#result <- result %>% group_by(conf.level) %>% slice_head(n = 3 * 18) %>% ungroup() # Show only 18 first rows in the plot
+p <- plot_risk_table(risk_table_6_full %>% filter(supersnip == 1), 
+                     important_predictors6, title=title, col = "sex", conf.level = c(0.95, 0.80),
+                     line.margin = 0.1, #unit(1, 'mm'),  # I have no idea how this works!
+                     max_x = 0.3,
+                     number_of_blocks = 8)
+if (save_figs) {
+  filename <- file.path(result_path, "presentation", "pdf", "risk_table_comparison_model.pdf")
+  pdf(filename, width=width/25.4, height=height/25.4, title=title)
+  plot(p[[1]], new_page=TRUE)
+  plot(p[[2]], new_page=FALSE)
+  invisible(dev.off())
+}
+dev.new()
+plot(p[[1]], new_page=TRUE)
+plot(p[[2]], new_page=FALSE)
+```
+
+For article.
+
+```{r, fig.width=width/25.4, fig.height=height/25.4}
+title <- "Comparison model risk table"
+p <- plot_risk_table(risk_table_6_full %>% filter(supersnip == 1), 
+                     important_predictors6, title="", col = "sex", conf.level = c(0.95, 0.80),
+                     line.margin = 0.1, #unit(1, 'mm'),  # I have no idea how this works!
+                     max_x = 0.3,
+                     number_of_blocks = 8)
+if (save_figs) {
+  filename <- file.path(final_figure_path, "pdf", "risk_table_comparison_model.pdf")
+  pdf(filename, width=width/25.4, height=height/25.4, title=title)
+  plot(p[[1]], new_page=TRUE)
+  plot(p[[2]], new_page=FALSE)
+  invisible(dev.off())
+}
+dev.new()
+plot(p[[1]], new_page=TRUE)
+plot(p[[2]], new_page=FALSE)
+```
+
+### Best FinnGen model
+
+For presentation.
+
+```{r, fig.width=width/25.4, fig.height=height/25.4}
+title <- "Best FinnGen risk table"
+filename <- file.path(table_path, "risk_table_5_full.tsv")
+risk_table_5_full <- read_tsv(filename, show_col_types = FALSE)  
+                              # The dataframe is a mixture of long and wide forms, since the graph part needs long format,
+                              # and table part needs wide format
+# This is now done inside the plot_risk_table
+# result <- result %>% group_by(conf.level) %>% slice_head(n = 3 * 18) %>% ungroup() # Show only 18 first rows in the plot
+p <- plot_risk_table(risk_table_5_full %>% filter(donations_in_five_years %in% c(0, 10)) %>% filter(supersnip == 1), 
+                     important_predictors5, title=title, col = "sex2", conf.level = c(0.95, 0.80),
+                     max_x = 0.3,
+                     number_of_blocks = 4)
+if (save_figs) {
+  filename <- file.path(result_path, "presentation", "pdf", "risk_table_best_finngen.pdf")
+  pdf(filename, width=width/25.4, height=height/25.4, title=title)
+  #pdf(filename, width=16, height=12, title=title)
+  plot(p[[1]], new_page=TRUE)
+  plot(p[[2]], new_page=FALSE)
+  invisible(dev.off())
+}
+dev.new()
+plot(p[[1]], new_page=TRUE)
+plot(p[[2]], new_page=FALSE)
+```
+
+For article.
+
+```{r, fig.width=width/25.4, fig.height=height/25.4}
+title <- ""
+p <- plot_risk_table(risk_table_5_full %>% filter(donations_in_five_years %in% c(0, 10)) %>% filter(supersnip == 1), 
+                     important_predictors5, title=title, col = "sex2", conf.level = c(0.95, 0.80),
+                     max_x = 0.3,
+                     number_of_blocks = 4)
+if (save_figs) {
+  filename <- file.path(final_figure_path, "pdf", "risk_table_best_finngen.pdf")
+  pdf(filename, width=width/25.4, height=height/25.4, title=title)
+  #pdf(filename, width=16, height=12, title=title)
+  plot(p[[1]], new_page=TRUE)
+  plot(p[[2]], new_page=FALSE)
+  invisible(dev.off())
+}
+dev.new()
+plot(p[[1]], new_page=TRUE)
+plot(p[[2]], new_page=FALSE)
+```
+
+```{r}
+conf.level = 0.80
+# Non-donors
+risk_table_5_full %>% 
+  filter(C282Y == 2, H63D == 0, supersnip == 1, credible1 == 0, donations_in_five_years == 0, conf.level == {{conf.level}}) %>% 
+  select(H63D, C282Y, supersnip, credible1, sex2, mean, lower, upper) %>%
+  mutate(across(c(mean, lower, upper), ~ sprintf("%.3f", .)))
+# 10 donations per five years
+risk_table_5_full %>% 
+  filter(C282Y == 2, H63D == 0, supersnip == 1, credible1 == 0, donations_in_five_years == 10, conf.level == {{conf.level}}) %>% 
+  select(H63D, C282Y, supersnip, credible1, sex2, mean, lower, upper) %>%
+  mutate(across(c(mean, lower, upper), ~ sprintf("%.3f", .)))
+```
+
+## All tables into an Excel file
+
+Read tables.
+
+Lead snips and fine-mapping results from hemochromatosis GWAS in FinnGen R12.
+
+```{r}
+filename <- "../data/E4_IRON_MET_R12_traditional.csv"
+hemochromatosis_traditional <- read_csv(filename)
+hemochromatosis_traditional <- hemochromatosis_traditional %>% select(- pos...5) %>%
+  rename(pos = pos...2)
+filename <- "../data/E4_IRON_MET_R12_finemapping.csv"
+hemochromatosis_finemapping <- read_csv(filename)
+```
+
+Compute the summary stats for credible1. Maybe this is in a wrong place: where is n defined?
+
+```{r}
+t <- hemochromatosis_traditional %>% filter(rsids == "rs181949568")
+conf.level <- 0.95
+alpha <- 1 - conf.level
+c <- qt(1 - alpha / 2, n-1, lower.tail = TRUE)
+beta <- t$beta
+ci <- beta + c(-1, 2) * t$sebeta * c
+or <- exp(beta)
+ci_or <- exp(ci)
+#glue("Credible1 (rs181949568) odds ratio {or} [{ci_or[1]} - {ci_or[2]}], p-value {t$pval}\n")
+sprintf("Credible1 (rs181949568) odds ratio %.2f [95%% CI %.2f - %.2f, p-value %.2e]\n", 
+        or, ci_or[1], ci_or[2], t$pval) %>% cat()
+```
+
+```{r}
+filename <- file.path(final_table_path, "hla_gwas.tsv")
+hla_gwas_cleaned <- read_tsv(filename)
+```
+
+```{r}
+filename <- file.path(table_path, "regenie_adjusted_interaction.txt.gz")
+regenie_adjusted_interaction <- read_delim(filename, delim=" ")
+significance_level <- -log10(5e-8 / 6)
+regenie_adjusted_interaction_significant <- regenie_adjusted_interaction %>% 
+  filter(LOG10P >= significance_level,
+         TEST == "ADD-INT_SNPxchr6_26092913_G_A")
+```
+
+
+```{r}
+filename <- file.path(table_path, "all_models_full_data_cis.tsv")
+all_models_full_data_cis <- read_tsv(filename)
+```
+
+```{r}
+disease_lags <- tribble(
+  ~Phenocode, ~Lag, ~Name,
+  "C3_CANCER", 5, "Malignant neoplasm",
+  "E4_HYTHYNAS", 5, "Hypothryroidism",
+  "I9_HYPTENSESS", 1, "Hypertension",
+  "K11_CHOLELITH", 5, "Cholelithiasis",
+  "M13_ARTHROSIS", 1, "Arthrosis"
+)
+disease_lags
+```
+
+```{r logistic-cis-5-wild}
+filename <- file.path(table_path, "logistic_cis_5_wild.tsv")
+logistic_cis_5_wild <- read_tsv(filename)
+```
+
+```{r}
+filename <- file.path(table_path, "snip_table.tsv")
+snip_table <- read_tsv(filename)
+snip_table
+```
+
+```{r}
+filename <- file.path(table_path, "tabletwo.tsv")
+tabletwo <- read_tsv(filename)
+```
+
+```{r}
+filename <- file.path(table_path, "xg_importance_5.tsv")
+xg_importance_5 <- read_tsv(filename)
+filename <- file.path(table_path, "xg_importance_7.tsv")
+xg_importance_7 <- read_tsv(filename)
+```
+
+```{r}
+filename <- file.path(table_path, "risk_table_6_full.tsv")
+risk_table_6_full <- read_tsv(filename, show_col_types = FALSE)  
+filename <- file.path(table_path, "risk_table_5_full.tsv")
+risk_table_5_full <- read_tsv(filename, show_col_types = FALSE)  
+```
+
+```{r}
+# Writes each data frame in list 'dfs' to a separate sheet in an excel work book.
+# The list names will be inserted on row 1 and the data frames is written starting on row 'startRow'.
+my_write_xlsx <- function(dfs, file=filename, asTable=FALSE, overwrite=TRUE, 
+                          creator=NULL, title=NULL, subject=NULL,
+                          number_of_main_text_tables=NULL, ...) {
+  wb <- createWorkbook(creator=creator, title=title, subject=subject)
+  if (is.null(number_of_main_text_tables))
+    number_of_main_text_tables <- length(dfs)   # All tables belong to the main text and no tables in the supplement
+  for (i in 1:length(dfs)) {
+    addWorksheet(wb, if (i <= number_of_main_text_tables) sprintf("Table %i", i) else sprintf("Table S%i", i-number_of_main_text_tables))
+    writeData(wb = wb, sheet = i, names(dfs)[i], xy = c("A", 1))
+    writeDataTable(wb = wb, sheet = i, dfs[[i]], ...)
+  }
+  saveWorkbook(wb, filename, overwrite = overwrite) 
+}
+```
+
+```{r}
+supplemental_tables <- tribble(
+  ~table, ~tag, ~description,
+  # Main text
+#  group_sizes, "", "FinnGen participant subgroup sizes.",
+  # Supplement
+  hemochromatosis_traditional, "#tbl-hemochromatosis-traditional", "Lead SNPs from hemochromatosis GWAS in FinnGen R12.", 
+  hemochromatosis_finemapping, "#tbl-hemochromatosis-finemapping", "Fine-mapping results from hemochromatosis GWAS in FinnGen R12.", 
+  hla_gwas_cleaned, "#tbl-hla-gwas", "Association analysis between hemochromatosis and HLA alleles.",
+  regenie_adjusted_interaction_significant, "#tbl-regenie-adjusted-interaction", "The 67 SNPs putatively interacting with C282Y, obtained from Regenie hemochromatosis interaction GWAS.",
+  tabletwo, "#tbl-table-two", "Dosage information on the SNPs chosen as predictors of hemochromatosis diagnosis. The effect alleles are given after the RSIDs, separated by dashes.",
+  all_performances2, "#tbl-all-performances", "Prediction performances of the logistic models of hemochromatosis fit on the FinnGen train data (264 cases and 210,007 controls).",
+  all_models_full_data_cis, "#tbl-all-models-full-data-cis", "Effects sizes of the hemochromatosis incidence, survival and severity models.",
+  xg_importance_5, "#tbl-xg-importance-5", "Variable importances from the Best FinnGen XGBoost model.",
+  xg_importance_7, "#tbl-xg-importance-7", "Variable importances from the All interactions XGBoost model.",
+  disease_lags, "#tbl-disease-lags", "The diseases prior the first hemochromatosis diagnosis used for prediction. The lag column tells the number of years the disease must predate the first hemochromatosis diagnosis.",
+  logistic_cis_5_wild, "#tbl-logistic-cis-5-wild", "The Best FinnGen model fitted on data with all C282Y carriers removed.",
+  cis_alternative_full_6, "#tbl-logistic-cis-sensitivity-full-6", "Comparison model with alternative response definition.",
+  cis_alternative_full_5, "#tbl-logistic-cis-sensitivity-full-5", "The Best FinnGen model with alternative response definition.",
+  cis_zip2_full_window, "#tbl-cis-zip2-full-window", "Alternative version of the disease severity model.",
+  risk_table_6_full, "#tbl-risk-table-6-full", "Risk table of the FinnGen comparison logistic model.",
+  risk_table_5_full, "#tbl-risk-table-5-full", "Risk table of the Best FinnGen logistic model.",
+  snip_table, "#tbl-snip-table", "Information on the SNPs used in hemochromatosis prediction models."
+)
+
+
+# Style for header line
+hs <- createStyle(
+  textDecoration = "BOLD", fontColour = "#FFFFFF", 
+  #fontSize = 12, fontName = "Arial Narrow", 
+  fgFill = "#4F80BD"
+)
+
+# Old example:
+# wb <- openxlsx::write.xlsx(dfs, file = filename, 
+#                            startRow = 2, headerStyle=hs,
+#                            creator="Jarkko Toivonen")
+```
+
+```{r}
+supplemental_tables %>% 
+  mutate(item = sprintf("Table S%i", row_number()),
+         description = str_sub(description, 1, 80)) %>% 
+  select(item, description) %>%
+  #print(n=Inf)
+  View()
+```
+
+
+```{r}
+filename <- file.path(final_table_path, "all_tables.xlsx")
+dfs <- supplemental_tables %>% select(description, table) %>% deframe()
+number_of_main_text_tables <- 0
+wb <- my_write_xlsx(dfs, file = filename, 
+                    startRow = 2, headerStyle=hs,
+                    creator="Jarkko Toivonen",
+                    title="Hemochromatosis prediction",
+                    subject="Supplemental tables",
+                    number_of_main_text_tables=number_of_main_text_tables)
+
+```
+
+## Kaplan-Meier
+
+### Genotype and sex
+
+```{r}
+filename <- file.path(table_path, "kaplan_meier_genotype_sex.tsv.gz")
+km <- read_tsv(filename)
+```
+
+Presentation.
+
+```{r}
+g <- km %>% 
+  mutate(name = paste(genotype, sex, sep=", ")) %>%
+  ggplot(aes(x=time, y=estimate, ymin=conf.low, ymax=conf.high, fill=name, color=name)) +
+  geom_step() +
+  geom_ribbon(alpha=0.3, color=NA) +
+  lims(y=0:1) +
+  labs(x="Age", y="Survival probability", color="Strata", fill="Strata") +
+  theme_classic()
+if (save_figs) {
+  filename <- file.path(result_path, "presentation", "pdf", "kaplan_meier_genotype_sex.pdf")
+  ggsave(filename, g, width=180, height=90, unit="mm", title="Kaplan-Meier")
+}
+g
+```
+
+For manuscript.
+
+```{r}
+g <- km %>% 
+  mutate(name = paste(genotype, sex, sep=", ")) %>%
+  ggplot(aes(x=time, y=estimate, ymin=conf.low, ymax=conf.high, fill=name, color=name)) +
+  geom_step() +
+  geom_ribbon(alpha=0.3, color=NA) +
+  lims(y=0:1) +
+  labs(x="Age", 
+       #y="Survival probability", 
+       y="Survival from hemochromatosis diagnosis", 
+       color="Strata", fill="Strata") +
+  guides(colour = guide_legend(reverse = TRUE), fill = guide_legend(reverse = TRUE)) +
+  theme_classic()
+if (save_figs) {
+  filename <- file.path(final_figure_path, "pdf", "kaplan_meier_genotype_sex.pdf")
+  ggsave(filename, g, width=180, height=90, unit="mm", title="Kaplan-Meier")
+}
+g
+```
+
+### Genotype
+
+```{r}
+filename <- file.path(table_path, "kaplan_meier_genotype.tsv.gz")
+km2 <- read_tsv(filename)
+```
+
+```{r}
+g <- km2 %>% 
+  mutate(
+    genotype = if_else(genotype == "Compound heterozygote", "H63D heterozygote x\nC282Y heterozygote", genotype), 
+    name=genotype) %>%
+  ggplot(aes(x=time, y=estimate, ymin=conf.low, ymax=conf.high, fill=name, color=name)) +
+  geom_step() +
+  geom_ribbon(alpha=0.3, color=NA) +
+  lims(y=0:1) +
+  labs(x="Age", y="Survival probability", color="Strata", fill="Strata") +
+  theme_classic()
+if (save_figs) {
+  filename <- file.path(result_path, "presentation", "pdf", "kaplan_meier_genotype.pdf")
+  ggsave(filename, g, width=180, height=90, unit="mm", title="Kaplan-Meier")
+}
+g
+```
+
+## Random stuff
+
+Compare old vs new ukbb results
+
+
+```{r, eval=FALSE}
+filename <- file.path(table_path, "old_ukbb_logistic_cis_full_6.tsv")
+old_ukbb_logistic_cis_full_6 <- read_tsv(filename) %>%
+  mutate(term = reverse_interactions(term))
+filename <- file.path(table_path, "old_ukbb_cox_cis_full_6.tsv")
+old_ukbb_cox_cis_full_6 <- read_tsv(filename)
+```
+
+```{r, eval=FALSE}
+change_logistic_cis_6 <- bind_rows(old = old_ukbb_logistic_cis_full_6, new=ukbb_logistic_cis_full_6, .id="model")
+g <- plot_cis2(change_logistic_cis_6, "UKBB Logistic model 6") + labs(y="Variable", color="Model") +
+  theme(axis.title.y = element_blank()) + guides(colour = guide_legend(reverse = TRUE))
+ggsave("/tmp/change_logistic_cis_6.png", g)
+g
+```
+
+```{r, eval=FALSE}
+change_cox_cis_6 <- bind_rows(old = old_ukbb_cox_cis_full_6, new=ukbb_cox_cis_full_6, .id="model")
+g <- plot_cis2(change_cox_cis_6, "UKBB Cox model 6") + labs(y="Variable", x="Hazard ratio", color="Model") +
+  theme(axis.title.y = element_blank()) + guides(colour = guide_legend(reverse = TRUE))
+ggsave("/tmp/change_cox_cis_6.png", g)
+g
+```
+
+### Combined effect of C282Y and H63D
+
+```{r}
+# cis is a dataframe of effect sizes
+C282Y_plus_H63D <- function(cis) {
+  helper <- function(cis) { 
+    function(variable) { 
+      res <- cis %>% filter(term == variable) %>% pull(estimate)
+      if (length(res) == 0) NA else res
+    } 
+  }
+  
+  f <- helper(cis)   # Function f gets the effect size of a variable from the cis dataframe
+  tribble(
+    ~C282Y, ~H63D, ~`odds ratio`,
+    0, 0, 1,
+    0, 1, f("H63D_X1"),
+    0, 2, f("H63D_X2"),
+    1, 0, f("C282Y_X1"),
+    1, 1, f("C282Y_X1") * f("H63D_X1")    * f("H63D_X1_x_C282Y_X1"),
+    1, 2, f("C282Y_X1") * f("H63D_X2")    * f("H63D_X2_x_C282Y_X1"),
+    2, 0, f("C282Y_X2"),
+    2, 1, f("C282Y_X2") * f("H63D_X1")    * f("H63D_X1_x_C282Y_X2"),
+    2, 2, f("C282Y_X2") * f("H63D_X2")    * f("H63D_X2_x_C282Y_X2"),
+  )
+}
+```
+
+```{r}
+tmp <- C282Y_plus_H63D(fg_logistic_cis_full_6) 
+tmp %>% mutate(name = glue("C282Y={C282Y} H63D={H63D}")) %>%
+  ggplot(aes(x=`odds ratio`, y = name)) +
+  geom_point()
+```
+

@@ -1,0 +1,2270 @@
+---
+title: "Hemochromatosis exploration in FinnGen"
+author: "Jarkko Toivonen"
+date: "`r Sys.Date()`"
+format: 
+  html:
+    df-print: kable
+    toc: true
+    toc-depth: 4
+    embed-resources: true
+---
+
+## TODO
+
+- DONE Other diagnoses before and after first hc diagnosis
+- DONE Enrichment/european MAF for snips
+- DONE Download document, smooth distributions
+- Confidence intervals for dosage counts?
+- DONE More snips in the analysis and do LD and HWE checks for them
+
+## Setup
+
+```{r setup}
+library(tidyverse)
+library(glue)
+library(lubridate)
+library(patchwork)
+# Data manipulation related
+#library(data.table)
+library(dbplyr)
+library(openxlsx)
+library(broom)
+library(rsample)
+
+# BigQuery connection related
+library(bigrquery)
+library(DBI)
+
+source("common.R")
+
+release <- "r12"; Release <- str_to_upper(release)
+
+result_path <- file.path("../results", release)
+cat(sprintf("result_path=%s", result_path), 
+    sprintf("release=%s", release),
+    sep = "\n",
+    file = "../data/bash_init")  # Store the variables for bash chunks
+
+data_path <- "../data"
+figure_path <- file.path(result_path, "figures")
+table_path <- file.path(result_path, "tables")
+c(figure_path, table_path) %>% discard(dir.exists) %>% walk(~dir.create(., recursive = TRUE))  # Create dirs if they don't exist
+recompute <- FALSE
+save_figs <- FALSE
+save_tables <- FALSE
+
+
+#no_individual_level_data <- TRUE
+allow_individual_level_data <- FALSE
+ldstore <- "~/usr/bin/ldstore_v2.0_x86_64"
+bgenix <- "~/usr/bin/bgenix"
+```
+
+## Functions
+
+
+
+```{r}
+#| code-fold: true
+# cut_helper reduces the number of breaks so that the bin sizes are all at least 10.
+# It achieves this by dropping the small bins from both ends of the distributions,
+# and forming new bins to this more narrow range.
+# This is suboptimal solution.
+cut_helper <- function(v) {
+  # Get the count in each bin
+  x <- table(cut(v, breaks=30)) %>%
+    as_tibble(.name_repair="unique") %>% 
+    rename(f="...1")
+  # Extract the start and end point of each bin
+  x2 <- x %>% 
+    extract(col = f, regex = "^\\((.*),(.*)]$", into=c("start", "end")) %>%
+    mutate(across(c(start, end), as.double))
+  x3 <- x2 %>% filter(n >= 10)   # Drop small bins
+  #x3 <- x2 %>% filter(n >= 5)
+  n <- nrow(x3)  # number of bins
+  r <- c(min(x3$start), max(x3$end))  # New, more narrow range of data
+  bin_width <- (r[2] - r[1]) / n      
+  breaks <- seq(r[1], r[2], length.out=n+1) # Cut the range into bins
+  list(r=r, n=n, breaks=breaks)
+}
+my_histogram <- function(df, name="CHILD_WEIGHT") {
+  #L <- cut_helper(df, name)
+  L <- cut_helper(df[[name]])
+  df %>% ggplot(aes(.data[[name]])) + geom_histogram(breaks=L$breaks)
+}
+
+```
+
+## Load data sets
+
+### Extract hemochromatosis cases
+
+There seems to be problem with the BigQuery system. The following doesn't work.
+
+```{r, eval=FALSE}
+library(bigrquery)
+library(dplyr)
+library(dbplyr)
+# Running some authentication code:
+projectid <- "fg-production-sandbox-5" # NB: ADD YOUR SANDBOX NUMBER!
+options(gargle_oauth_cache = FALSE)
+bq_auth(scopes = "https://www.googleapis.com/auth/bigquery")
+
+# Making a connection object that is used to connect to the tables:
+
+con = dbConnect(
+  bigrquery::bigquery(),
+  project = "finngen-production-library",
+  dataset = if (release == "r12") "sandbox_tools_r12" else "sandbox_tools_r13",
+  billing = projectid
+)
+
+if (release == "r12") {
+  endpoint = tbl(con, "endpoint_cohorts_r12_v1")
+} else {
+  endpoint = tbl(con, "endpoint_cohorts_r13_v3")
+}
+#endpoint = tbl(con, "finngen_r12_service_sector_detailed_longitudinal_v1")
+#info = tbl(con, "finngenid_info_r11_v1")
+#E4_IRON_MET
+```
+
+```{r, eval=FALSE}
+tmp <- endpoint %>% filter(ENDPOINT == "E4_IRON_MET") %>% 
+  count(CONTROL_CASE_EXCL) %>% 
+  collect()
+tmp
+```
+
+BigQuery doesn't seem to work, I will subset endpoints from command line.
+
+```{r}
+#endpoint_dir <- "/finngen/library-red/finngen_R12/endpoint_cohorts_v1.0"
+if (release == "r12") {
+  input_file <- "/finngen/library-red/finngen_R12/endpoint_cohorts_v1.0/endpoint_cohorts_r12_v1.csv.gz"
+} else {
+  input_file <- "/finngen/library-red/finngen_R13/endpoint_cohorts_v3.0/finngen_R13_endpoint_cohorts_r13_v3.csv.gz"
+}
+output_file <- file.path(result_path, "hemochromatosis.tsv.gz")
+cmd <- glue("zcat {input_file} | awk 'NR==1{{print}}{{if ($2 == \"E4_IRON_MET\") print}}' | gzip > {output_file}")
+print(cmd)
+if (!file.exists(output_file))
+  system(cmd)
+```
+
+|Field|Description|
+|---|---| 
+| FINNGENID | Subject id|  
+| ENDPOINT | endpoint name|
+| CONTROL_CASE_EXCL | Indicates if patient is control=0, case=1, excluded control=2 |
+| AGE | If case, the age of the first event now with three decimals to provide more accuracy |
+| APPROX_EVENT_DAY | approximate date of the first event |
+| NEVT | If case, the number of events |
+
+I assume that the AGE is at death or EOF for controls!
+
+```{r Read hemochromatosis}
+filename <- file.path(result_path, "hemochromatosis.tsv.gz")
+hc <- read_tsv(filename, n_max = Inf, col_types = cols(
+  FINNGENID = col_character(),
+  ENDPOINT = col_character(),
+  CONTROL_CASE_EXCL = col_double(),
+  AGE = col_double(),
+  APPROX_EVENT_DAY = col_date(),
+  NEVT = col_double()))
+```
+
+Number of controls, cases and exclusions.
+
+```{r}
+nrow(hc)   # This is the full R12 data
+```
+
+
+```{r}
+#hc %>% select(CONTROL_CASE_EXCL) %>% table()
+# 0 == control
+# 1 == case
+# 2 == exclusion
+hc %>% pull(CONTROL_CASE_EXCL) %>% as.factor() %>% fct_count(prop=TRUE)
+```
+
+```{r}
+hc <- hc %>% 
+  rename(hemochromatosis = CONTROL_CASE_EXCL,
+         sample = FINNGENID) %>%
+  filter(hemochromatosis != 2) %>%
+  mutate(hemochromatosis = as.factor(case_when(hemochromatosis == 1 ~ "case",
+                                               TRUE  ~  "control"))) %>%
+  select(-ENDPOINT)
+```
+
+### Venesections
+
+What codes are used for phlebotomy and venesection?
+
+```{bash}
+grep -Ei "FG_CODE1|phlebotomy|venesection" /finngen/library-green/medical_codes/fg_codes_info_v7/fg_codes_info.csv > /tmp/procedures.tsv
+```
+
+```{r}
+procedure_codes <- read_tsv("/tmp/procedures.tsv", show_col_types = FALSE)
+procedure_codes %>% select(-c(FG_CODE2:FG_CODE9, extra_info)) # Drop the NA columns
+```
+
+Get the venesections and phlebotomies from detailed longitudinal file.
+
+```{bash}
+. ../data/bash_init  # Read some bash variables
+#OUTDIR=/home/ivm/projects/hemochromatosis/results
+if [[ $release == "r12" ]] ; then
+  filename=/finngen/library-red/finngen_R12/phenotype_1.0/data/finngen_R12_detailed_longitudinal_1.0.txt.gz
+else
+  filename=/finngen/library-red/finngen_R13/phenotype_1.0/data/finngen_R13_detailed_longitudinal_1.0.txt.gz
+fi
+result=$result_path/venesections.tsv
+zresult=$result.gz
+# awk is slow, let's use grep instead. BigQuery would be even better, or parquet
+if [[ ! -f $zresult ]] ; then
+  echo Creating file $zresult from $filename
+  zcat  $filename | head -n 1 > $result
+  zcat  $filename | grep -Ew "TPH00|SPAT1074" >> $result
+  gzip $result
+fi
+```
+
+The above may give warning "gzip: stdout: Broken pipe", but that is nothing to worry about.
+
+### Dosages
+
+Define interesting snips.
+
+```{r Snips}
+# Hemochromatosis mutations
+# rs1799945, c.187C>G, p.His63Asp (H63D)
+# rs1800562, c.845G>A, p. Cys282Tyr (C282Y)
+snips <- tribble(#~id, ~name, ~rsid, ~chr, ~pos, ~ref, ~alt,
+  ~SNPID, ~name, ~rsid, ~chromosome, ~position, ~first, ~second,
+  "chr6_26071867_A_C", "H1-2",      "rs9968910", 6, 26071867, "A", "C",
+  "chr6_26090951_C_G", "H63D",      "rs1799945", 6, 26090951, "C", "G",
+  "chr6_26090957_A_T", "S65C",      "rs1800730", 6, 26090957, "A", "T",
+  "chr6_26092913_G_A", "C282Y",     "rs1800562", 6, 26092913, "G", "A",
+  "chr6_32636375_A_G", "supersnip", "rs9272324", 6, 32636375, "A", "G")
+snip_names <- snips %>% pull(name)
+conv <- snips %>% select(name, SNPID) %>% deframe()
+snips_filename <- file.path(data_path, "snips.tsv")
+if (! file.exists(snips_filename))
+  write_tsv(snips %>% select(SNPID), snips_filename, col_names = FALSE)
+```
+
+Extract the variants.
+
+```{r Extract variants}
+# qctool -g input.bgen -s input.sample -og output.vcf -incl-samples-where 'ID_1 = 123455'
+# /finngen/library-red/finngen_R12/bgen_2.0/data/chrom/finngen_R12_6.bgen
+if (release == "r12") {
+  bgen_base <- "/finngen/library-red/finngen_R12/bgen_2.0/data/chrom"
+} else {
+  bgen_base <- "/finngen/library-red/finngen_R13/bgen_1.0/data/chrom"
+}
+input_bgen <- file.path(bgen_base, glue("finngen_{str_to_upper(release)}_6.bgen"))
+input_sample <- file.path(bgen_base, glue("finngen_{str_to_upper(release)}_6.bgen.sample"))
+output <- file.path(result_path, "snips.bgen")
+
+# Use bgenix, it is faster
+cmd <- glue("{bgenix} -g {input_bgen} -incl-rsids {snips_filename} > {output}")
+# qctool is slower
+#cmd <- glue("qctool -g {input_bgen} -s {input_sample} -og {output} -ofiletype bgen -incl-snpids {snips_filename}")
+# The -incl-rsids option didn't seem to work. Maybe the rsids are not stored in the FinnGen bgens
+
+# One can list the snip names in a bgen file with command "bgenix -g input.bgen -list"
+print(cmd)
+if (!file.exists(output)) {
+  system(cmd)
+}
+# Create the index
+cmd <- glue("{bgenix} -g {output} -index")
+print(cmd)
+if (!file.exists(file.path(result_path, "snips.bgen.bgi"))) {
+  system(cmd)
+}
+```
+
+qctool took 9m16.454s
+bgenix took 0m4.236s
+
+Extract dosages.
+
+```{r Extract dosages}
+input_bgen <- file.path(result_path, "snips.bgen")
+#input_sample <- "../results/snips.sample"   # This file does not exist
+output <- file.path(result_path, "snips.dosage")
+cmd <- glue("qctool -g {input_bgen} -og {output} -ofiletype dosage -incl-snpids {snips_filename}")
+#cmd <- glue("qctool -g {input_bgen} -s {input_sample} -og {output} -ofiletype dosage -incl-snpids {snips_filename}")
+# The -incl-rsids option didn't seem to work. Maybe the rsids are not stored in the FinnGen bgens
+# One can list the snip names in a bgen file with command "bgenix -g input.bgen -list"
+print(cmd)
+if (!file.exists(output)) {
+  system(cmd)
+}
+```
+
+Read dosages.
+
+```{r Read snip dosages}
+dosages_filename <- file.path(result_path, "snips.dosage")
+dosages <- read_delim(dosages_filename, delim=" ", col_types = cols(position = col_integer(), .default = col_character()))
+dosages <- dosages %>% 
+  select(-c(chromosome, rsid, position, alleleA, alleleB)) %>% 
+  pivot_longer(cols=-c("SNPID"), names_to = "sample", values_to = "dosage") %>% 
+  mutate(dosage = as.integer(dosage)) %>%
+  inner_join(snips %>% select(SNPID, rsid, name), by="SNPID")
+dosages_wide <- dosages %>% pivot_wider(names_from=name, values_from=dosage, id_cols = sample)
+```
+
+Compute snpstats using qctool.
+
+```{r Compute snpstats}
+input_file <- file.path(result_path, "snips.bgen")
+output_file <- file.path(result_path, "snp-stats.txt")
+cmd <- glue("qctool -g {input_file} -snp-stats -osnp {output_file}")
+print(cmd)
+if (! file.exists(output_file)) {
+  system(cmd)
+}
+```
+
+Read snp-stats.
+
+```{r}
+stats <- read_delim(output_file, delim=" ", comment="#")
+```
+
+
+
+```{r}
+stats %>% 
+  select(-c(rsid, chromosome, position, alleleA, alleleB, comment, minor_allele, major_allele)) %>%
+  pivot_longer(cols=-alternate_ids) %>% 
+  pivot_wider(names_from=alternate_ids) %>%
+  rename(all_of(conv)) %>%
+  print(n=Inf)
+```
+
+There is more evidence of C282Y being in linkage disequilibrium. Are all five snips in
+Hardy-Weinberg disequilibrium?
+
+### Certain hla allele dosages
+
+Extract dosages of the following alleles.
+
+```{r}
+hla_alleles <- tibble(allele = c(
+  "F*01:01",
+  "F*01:03",
+  "G*010101c",
+  "G*UTR-4",
+  "G*01:01:01:05",
+  "A*03:01",
+  "C*07:02",
+  "B*07:02"
+))
+```
+
+```{r Extract nonclassical HLA dosages}
+hla_alleles_filename <- file.path(data_path, "hla_alleles.tsv")
+if (! file.exists(hla_alleles_filename))
+  write_tsv(hla_alleles %>% select(allele), hla_alleles_filename, col_names = FALSE)
+input_bgen <- file.path(data_path, "R12_ncHLA.bgen")
+#input_sample <- "../results/snips.sample"   # This file does not exist
+output <- file.path(result_path, "hla_5_alleles.dosage")
+cmd <- glue("qctool -g {input_bgen} -og {output} -ofiletype dosage -incl-rsids {hla_alleles_filename}")
+# One can list the snip names in a bgen file with command "bgenix -g input.bgen -list"
+print(cmd)
+if (!file.exists(output)) {
+  system(cmd)
+}
+```
+
+```{r Extract classical HLA dosages}
+hla_alleles_filename <- file.path(data_path, "hla_alleles.tsv")
+if (! file.exists(hla_alleles_filename))
+  write_tsv(hla_alleles %>% select(allele), hla_alleles_filename, col_names = FALSE)
+input_bgen <- glue("/finngen/library-red/finngen_{Release}/hla_1.0/bgen/{Release}_HLA.bgen")
+#input_sample <- "../results/snips.sample"   # This file does not exist
+output <- file.path(result_path, "hla_3_alleles.dosage")
+cmd <- glue("qctool -g {input_bgen} -og {output} -ofiletype dosage -incl-rsids {hla_alleles_filename}")
+# One can list the snip names in a bgen file with command "bgenix -g input.bgen -list"
+print(cmd)
+if (!file.exists(output)) {
+  system(cmd)
+}
+```
+
+Read dosages. 
+
+```{r Read hla dosages}
+classical_hla_filename <- file.path(result_path, "hla_3_alleles.dosage")
+nonclassical_hla_filename <- file.path(result_path, "hla_5_alleles.dosage")
+classical_hla_dosages <- read_delim(classical_hla_filename, delim=" ", col_types = cols(position = col_integer(), .default = col_character()))
+nonclassical_hla_dosages <- read_delim(nonclassical_hla_filename, delim=" ", col_types = cols(position = col_integer(), .default = col_character()))
+hla_dosages <- bind_rows(classical_hla_dosages, nonclassical_hla_dosages) %>% 
+  select(-c(chromosome, rsid, position, alleleA, alleleB)) %>% 
+  pivot_longer(cols=-c("SNPID"), names_to = "sample", values_to = "dosage") %>% 
+  mutate(dosage = as.integer(dosage)) #%>%
+  #inner_join(hla_alleles %>% select(allele, rsid, name), by="SNPID")
+hla_dosages_wide <- hla_dosages %>% pivot_wider(names_from=SNPID, values_from=dosage, id_cols = sample)
+hla_dosages_wide <- hla_dosages_wide %>% mutate(sample = str_remove(sample, "_.*$"))
+```
+
+### HLA snip dosages
+
+```{r}
+hc_significant <- read_csv("../data/E4_IRON_MET_R12_traditional.csv")
+hc_significant <- hc_significant %>% 
+  rename(pos_hg38 = "pos...2",
+         rsid = rsids) %>% 
+  mutate(SNPID = sprintf("chr%i_%i_%s_%s", chrom, pos_hg38, ref, alt), .before = 1)
+hc_significant
+```
+
+
+
+```{r}
+tmp_conv <- c(
+  rs114179634 = "HLA1",
+  rs9261354   = "HLA4",
+  rs3094093   = "HLA2")
+hla_snip_info <- hc_significant %>% 
+  filter(chrom==6 & 28510120 <= pos_hg38 & pos_hg38 <= 33480577, # HLA area
+         pval < 5e-8) %>% arrange(pos_hg38) %>%
+    mutate(name = tmp_conv[rsid], .after = SNPID)
+filename <- file.path(data_path, "hla_snip_info.tsv")
+write_tsv(hla_snip_info, filename)
+hla_snip_info
+```
+
+The snip rs9261354 is correlated with other HLA snip and causes high VIF if included in the model. Hence, I won't
+include it in the model. In addition, the snip is not available in UKBB.
+
+Write snip ids to a temp file.
+
+```{r}
+snip_id_filename <- "/tmp/hla_snips_ids.tsv"
+if (! file.exists(snip_id_filename))
+  write_tsv(hla_snip_info %>% select(SNPID), snip_id_filename, col_names = FALSE)
+```
+
+Extract the variants with bgenix.
+
+```{r Extract variants2}
+#bgen_base <- "/finngen/library-red/finngen_R12/bgen_2.0/data/chrom"
+if (release == "r12") {
+  input <- "/finngen/library-red/finngen_R12/bgen_2.0/data/chrom/finngen_R12_6.bgen"
+} else {
+  input <- "/finngen/library-red/finngen_R13/bgen_1.0/data/chrom/finngen_R13_6.bgen"
+}
+input_sample <- paste0(input, ".sample")
+output <- file.path(result_path, "hla_snips.bgen")
+
+cmd <- glue("{bgenix} -g {input} -incl-rsids {snip_id_filename} > {output}")
+print(cmd)
+if (!file.exists(output)) {
+  system(cmd)
+}
+# Create the index
+cmd <- glue("{bgenix} -g {output} -index")
+print(cmd)
+if (!file.exists(file.path(result_path, "hla_snips.bgen.bgi"))) {
+  system(cmd)
+}
+```
+
+qctool took 9m16.454s
+bgenix took 0m4.236s
+
+Extract dosages.
+
+```{r Extract dosages2}
+input_bgen <- file.path(result_path, "hla_snips.bgen")
+#input_sample <- "../results/snips.sample"   # This file does not exist
+output <- file.path(result_path, "hla_snips.dosage")
+cmd <- glue("qctool -g {input_bgen} -og {output} -ofiletype dosage -incl-snpids {snip_id_filename}")
+print(cmd)
+if (!file.exists(output)) {
+  system(cmd)
+}
+```
+
+
+Read dosages.
+
+```{r Read dosages2}
+filename <- file.path(table_path, "tidy_hla_dosages.tsv.gz")
+if (! file.exists(filename)) {
+  tmp <- read_delim(output, delim=" ", col_types = cols(position = col_integer(), .default = col_character()))
+  tmp <- tmp %>% 
+    select(-c(chromosome, rsid, position, alleleA, alleleB)) %>% 
+    inner_join(hla_snip_info %>% select(SNPID, rsid), by="SNPID") %>%
+    select(-SNPID) %>%
+    pivot_longer(cols=-c("rsid"), names_to = "sample", values_to = "dosage") %>% 
+    mutate(dosage = as.integer(dosage)) #%>%
+  #inner_join(credible_snips %>% select(SNPID="locus_id", name), by="SNPID")
+  #dosages_wide <- dosages %>% pivot_wider(names_from=name, values_from=dosage, id_cols = sample)
+  hla_snips <- tmp %>% pivot_wider(names_from=rsid, values_from=dosage, id_cols = sample)
+  write_tsv(hla_snips, filename)
+} else  {
+  hla_snips <- read_tsv(filename)
+}
+hla_snip_names <- hla_snip_info$rsid
+hla_snips %>% select(-sample) %>% mutate(across(everything(), as.factor)) %>% summary()
+```
+
+
+
+### HC credible snips
+
+```{r}
+tmp <- read_csv("../data/E4_IRON_MET_R12_finemapping.csv")
+tmp <- tmp %>%
+  rename(pos_hg38 = pos)
+tmp
+```
+
+```{r}
+credible_snip_info <- tribble(
+  ~SNPID, ~name, ~rsid, ~chromosome, ~pos_hg38, ~first, ~second,
+  "chr6_21989753_T_C", "credible1", "rs181949568",  6, 21989753, "T", "C",
+  "chr6_22583313_C_A", "credible2", "rs1284018747", 6, 22583313, "C", "A",
+  "chr6_23835557_A_T", "credible3", "rs1300021441", 6, 23835557, "A", "T"
+)
+credible_snip_info <- credible_snip_info %>%
+  right_join(tmp, by=c(SNPID="locus_id", "pos_hg38"))
+credible_snip_info <- credible_snip_info %>% filter(good_cs) # Drop one bad credible set representative
+filename <- file.path(data_path, "credible_snip_info.tsv")
+write_tsv(credible_snip_info, filename)
+credible_snip_info
+credible_snip_names <- credible_snip_info$name
+```
+
+
+
+Write snip ids to a temp file.
+
+```{r}
+snip_id_filename <- "/tmp/credible_snips_ids.tsv"
+if (! file.exists(snip_id_filename))
+  write_tsv(credible_snip_info %>% select(SNPID), snip_id_filename, col_names = FALSE)
+```
+
+Extract the credible variants with bgenix.
+
+```{r Extract variants3}
+if (release == "r12") {
+  input <- "/finngen/library-red/finngen_R12/bgen_2.0/data/chrom/finngen_R12_6.bgen"
+} else {
+  input <- "/finngen/library-red/finngen_R13/bgen_1.0/data/chrom/finngen_R13_6.bgen"
+}
+#bgen_base <- "/finngen/library-red/finngen_R12/bgen_2.0/data/chrom"
+#input_bgen <- file.path(bgen_base, "finngen_R12_6.bgen")
+input_sample <- paste0(input, ".sample")
+output <- file.path(result_path, "credible_snips.bgen")
+
+cmd <- glue("{bgenix} -g {input} -incl-rsids {snip_id_filename} > {output}")
+print(cmd)
+if (!file.exists(output)) {
+  system(cmd)
+}
+# Create the index
+cmd <- glue("{bgenix} -g {output} -index")
+print(cmd)
+if (!file.exists(file.path(result_path, "credible_snips.bgen.bgi"))) {
+  system(cmd)
+}
+```
+
+qctool took 9m16.454s
+bgenix took 0m4.236s
+
+Extract dosages.
+
+```{r Extract dosages3}
+input_bgen <- file.path(result_path, "credible_snips.bgen")
+#input_sample <- "../results/snips.sample"   # This file does not exist
+output <- file.path(result_path, "credible_snips.dosage")
+cmd <- glue("qctool -g {input_bgen} -og {output} -ofiletype dosage -incl-snpids {snip_id_filename}")
+print(cmd)
+if (!file.exists(output)) {
+  system(cmd)
+}
+```
+
+Read dosages.
+
+```{r Read dosages3}
+filename <- file.path(table_path, "tidy_credible.dosages.tsv.gz")
+if (! file.exists(filename)) {
+  tmp <- read_delim(output, delim=" ", col_types = cols(position = col_integer(), .default = col_character()))
+  tmp <- tmp %>% 
+    select(-c(chromosome, rsid, position, alleleA, alleleB)) %>% 
+    inner_join(credible_snip_info %>% select(SNPID, name), by="SNPID") %>%
+    pivot_longer(cols=-c("SNPID", "name"), names_to = "sample", values_to = "dosage") %>% 
+    mutate(dosage = as.integer(dosage)) #%>%
+  #inner_join(credible_snips %>% select(SNPID="locus_id", name), by="SNPID")
+  #tmp_wide <- tmp %>% pivot_wider(names_from=name, values_from=dosage, id_cols = sample)
+  credible_snips <- tmp %>% pivot_wider(names_from=name, values_from=dosage, id_cols = sample)
+  write_tsv(credible_snips, filename)
+} else {
+  credible_snips <- read_tsv(filename)
+}
+credible_snips %>% select(-sample) %>% mutate(across(everything(), as.factor)) %>% summary()
+```
+
+```{r}
+#filename <- file.path(table_path, "tidy_credible.dosages.tsv.gz")
+#credible_snips <- read_tsv(filename, show_col_types = FALSE)
+#credible_snip_names <- c("credible1", "credible2", "credible3")
+#credible_snips %>% select(-sample) %>% mutate(across(everything(), as.factor)) %>% summary()
+```
+
+### Linkage disequilirium
+
+#### LDs using ldstore.
+
+Describe variants.
+
+```{r}
+# rsid chromosome position allele1 allele2
+# rs1 10 1 T C
+# rs2 10 1 A G
+# rs3 10 1 G A
+zfile <- snips %>% select(rsid=SNPID, chromosome, position, allele1=first, allele2=second) %>%
+  mutate(chromosome = paste0("chr", chromosome))
+zfilename <- file.path(result_path, "ldstore_snips.z")
+if (! file.exists(zfilename))
+  write_delim(zfile, zfilename, delim = " ")
+```
+
+Describe other input.
+
+```{r}
+# z;bgen;bgi;bcor;ld;n_samples
+# dataset1.z;dataset1.bgen;dataset1.bgen.bgi;dataset1.bcor;;5363
+# dataset2.z;dataset2.bgen;dataset2.bgen.bgi;;dataset2.ld;5363
+masterfile <- tibble(z    = zfilename, 
+                     bgen = file.path(result_path, "snips.bgen"), 
+                     bgi  = file.path(result_path, "snips.bgen.bgi"), 
+                     bcor = file.path(result_path, "ldstore_snips.bcor"),
+                     ld   = file.path(result_path, "ldstore_snips.ld"),
+                     n_samples = if_else(release == "r12", 520210, 519972))
+masterfilename <- file.path(result_path, "ldstore_snips.master")
+if (! file.exists(masterfilename))
+  write_delim(masterfile, masterfilename, delim = ";")
+```
+
+```{r}
+cmd <- glue("{ldstore} --in-files {masterfilename} --write-bcor --read-only-bgen")
+print(cmd)
+if (! file.exists(masterfile$bcor))
+  system(cmd)
+cmd <- glue("{ldstore} --in-files {masterfilename} --bcor-to-text")
+print(cmd)
+if (! file.exists(masterfile$ld))
+  system(cmd)
+```
+
+Read the LD values.
+
+```{r}
+filename <- file.path(result_path, "ldstore_snips.ld")
+ld2 <- read_delim(filename, delim=" ", col_names = FALSE)  # These are Pearson correlations 
+ld2 <- ld2[,1:(ncol(ld2)-1)] # Remove empty column
+```
+
+
+
+```{r}
+#labels <- snips$name %>%  #paste(snips$name, snips$rsid, sep="\n") %>% 
+#  factor(levels=c("H1-2", "H63D", "C282Y"))
+labels <- snips$name
+snip_order <- c("H1-2", "H63D", "S65C", "C282Y", "supersnip")
+ld <- ld2 %>% set_names(labels) %>% 
+  mutate(x=factor(labels, snip_order)) %>% 
+  pivot_longer(cols=-x, names_to = "y") %>%
+  mutate(y = factor(y, snip_order))
+summary(ld)
+```
+
+
+```{r}
+ld %>%
+  mutate(y=fct_rev(y)) %>%
+  ggplot(aes(x, y, fill=value**2)) + 
+  geom_raster() +
+  geom_text(aes(label=sprintf("%.2f", value**2)), color="white") +
+  scale_fill_continuous(breaks=seq(0, 1, length.out = 5), limits=c(0,1)) +
+  scale_x_discrete(expand=expansion(add=0)) +
+  scale_y_discrete(expand=expansion(add=0)) +
+  labs(x="SNP 1", y="SNP 2", title="Linkage disequilibrium using ldstore", fill=bquote(R^2))
+```
+
+These numbers are not the same as in ldlink.nih.gov with Finnish panel.
+
+No LD between H63D and S65C even though they are only 6 bp apart!
+
+Should I restrict the samples to hemochromatosis cases and controls?
+
+#### LD through cor
+
+Lets compute this using a different method.
+
+```{r}
+pearson <- my_correlation(dosages_wide %>% select(-sample), snip_order)
+pearson
+```
+
+```{r}
+calc_element("geom", theme_gray())  # Note the output is in millimeters, even though input is in points
+```
+
+
+```{r}
+plot_correlation(pearson) #+ theme(geom.text = element_geom(fontsize = 11))
+```
+
+Same result as from ldstore. Ok, ldlink.nih.gov also gives R2 value 0.0006 for snips H63D and S65C using FIN population. 
+But note that S65C nucleotide T appears only once!!!
+
+
+### Enrichment
+
+Use tabix to quickly read the enrichment annotation file.
+
+```{r Extract enrichement information}
+input_filename <- "/finngen/library-green/finngen_R12/finngen_R12_analysis_data/annotations/R12_annotated_variants_v0.small.gz"
+#output_filename <- tempfile()
+output_filename <- file.path(table_path, "enrichment.tsv")
+snip_positions <- snips %>% glue_data("{chromosome}:{position}-{position}") %>% paste(collapse=" ")
+cmd <- glue("tabix -h {input_filename} {snip_positions} > {output_filename}")
+print(cmd)
+if (!file.exists(output_filename)) {
+  system(cmd)
+}
+```
+
+Read enrichment information.
+
+```{r Read enrichment information}
+enrichment <- read_tsv(output_filename)
+enrichment %>% 
+  select("#variant", INFO, AF, AC_Het, AC_Hom, most_severe, gene_most_severe, rsid, 
+         GENOME_enrichment_nfee, GENOME_enrichment_nfe) %>%
+  relocate("#variant", GENOME_enrichment_nfee, GENOME_enrichment_nfe)
+```
+
+The snips don't seem to be very Finnish specific.
+
+### Cohort info
+
+Load cohort info.
+
+```{r Load cohort info}
+filename <- glue("/finngen/library-red/finngen_{Release}/phenotype_1.0/data/finngen_{Release}_cohort_1.0.txt.gz")
+cohort <- read_tsv(filename, col_names=c("sample", "cohort"))
+```
+
+Define blood donor variable.
+
+```{r}
+bd <- cohort %>% mutate(blood_donor = cohort=="BLOOD SERVICE BIOBANK") %>% select(-cohort)
+bd %>% select(blood_donor) %>% table()
+```
+
+### Imputed sex
+
+```{r}
+if (release == "r12") {
+  filename <- "/finngen/library-red/finngen_R12/analysis_covariates/R12_COV_V2.FID.txt.gz"
+} else {
+  filename <- "/finngen/library-red/finngen_R13/analysis_covariates/data/R13_COV_V0.FID.txt.gz"
+}
+sex <- read_tsv(filename, col_select = c("FID", "SEX", "SEX_IMPUTED"))
+sex <- sex %>% rename(sample=FID)
+```
+
+No problems with sex:
+
+```{r}
+sex %>% select(-sample) %>% table(useNA = "always")
+```
+
+```{r}
+sex <- sex %>% select(-SEX_IMPUTED)
+```
+
+
+
+### Plot hemochromatosis
+
+```{r}
+helper <- function(df, par) {
+  palette <- scales::hue_pal()(2)
+  df <- df %>% 
+    filter(hemochromatosis == par)
+  breaks <- cut_helper_variable_width(df$AGE)$breaks
+  g <- df %>%
+    ggplot(aes(AGE)) + 
+    #(if (allow_individual_level_data) geom_histogram() else geom_density(aes(y=after_stat(count)), color=NA)) + 
+    #(if (allow_individual_level_data) geom_histogram() else 
+      geom_histogram(breaks=breaks, color="black", 
+                     fill=if_else(par=="case", palette[1], palette[2])) + 
+    geom_text(data = df %>%
+                count() %>%
+                #count(hemochromatosis) %>% 
+                mutate(x=0.2, y=0.9, label=glue("n={n}")), 
+              mapping=aes(I(x), I(y), label=label),
+              vjust=0, color="black", inherit.aes = FALSE
+    ) +
+    labs(x="Age", y="Count", title=glue("Hemochromatosis {par}s"), subtitle="Age at first event, death or EOF") #+
+    #facet_wrap(~ hemochromatosis, scales = "free")
+  g
+}
+g1 <- helper(hc, "case")
+g2 <- helper(hc, "control")
+min_bin_size(g1)
+min_bin_size(g2)
+g1+g2
+```
+
+Is the average diagnosis age different between males and females?
+
+```{r}
+tmp <- hc %>%
+  inner_join(sex, by="sample") %>%
+  filter(hemochromatosis == "case")
+tmp %>% group_by(SEX) %>% summarise(age = mean(AGE))
+male_age   <- tmp %>% filter(SEX == "male") %>% pull(AGE)
+female_age <- tmp %>% filter(SEX == "female") %>% pull(AGE)
+t.test(male_age, female_age)
+```
+
+```{r}
+#hc %>% ggplot(aes(NEVT)) + geom_histogram() + scale_y_continuous(trans = scales::log1p_trans())+
+#  labs(x="Number of events per person")
+breaks <- cut_helper_variable_width(hc$NEVT)$breaks
+g <- hc %>% ggplot(aes(NEVT)) + 
+  geom_histogram(breaks=breaks, color="white") + 
+  geom_text(aes(label=after_stat(count)), stat="bin", breaks=breaks, color="white", angle=90, hjust=1.1, vjust=0.5) +
+  scale_y_continuous(trans = scales::log1p_trans()) +
+  labs(x="Number of events per person", y="Number of persons in bin", 
+       title="Hemochromatosis events",
+       subtitle="Variable width histogram")
+min_bin_size(g)
+g
+```
+
+```{r}
+tmp <- hc %>% drop_na(APPROX_EVENT_DAY)
+breaks <- cut_helper_variable_width(tmp$APPROX_EVENT_DAY)$breaks
+g <- tmp %>% 
+  ggplot(aes(APPROX_EVENT_DAY)) + 
+  (if (allow_individual_level_data) 
+    geom_density(aes(y=after_stat(count))) else
+    #geom_histogram() else 
+    geom_histogram(breaks=breaks)
+  ) +
+  geom_vline(xintercept = as_date("1996-08-01"), color="red") +
+  annotate("text", x=lubridate::as_date("1990-01-01"), y=0.09, label=glue("n={nrow(tmp)}")) +
+  labs(y = if_else(allow_individual_level_data, "Density", "Count"),
+       title="First hemochromatosis events", subtitle="Variable width histogram")
+min_bin_size(g)
+g
+```
+
+```{r}
+tmp <- hc %>% drop_na(APPROX_EVENT_DAY)
+g <- tmp %>% 
+  mutate(rank = rank(APPROX_EVENT_DAY)) %>%
+  ggplot(aes(APPROX_EVENT_DAY, rank)) + 
+  geom_point() +
+  geom_vline(xintercept = as_date("1996-08-01"), color="red") +
+  annotate("text", x=lubridate::as_date("1990-01-01"), y=100, label=glue("n={nrow(tmp)}")) +
+  labs(y = "Count",
+       title="First hemochromatosis events", subtitle="Cumulative events")
+g
+```
+
+### Blood donation data
+
+```{r Read blood donation data}
+filename <- if (release == "r12") "/finngen/library-red/finngen_R11/FRCBS_blood_donor_data_1.0/data/finngen_R11_FRCBS_Blood_Donor_Donations_1.0.txt.gz" else "/finngen/library-red/finngen_R13/FRCBS_blood_donor_data/data/finngen_R13_FRCBS_Blood_Donor_Donations_1.0.txt.gz"
+donation <- read_tsv(filename)
+donation <- donation %>% 
+  mutate(across(BloodDonationTypeKey, as.factor)) %>%
+  rename(sample = FINNGENID,
+         status = BloodDonationTypeKey)
+```
+
+```{r}
+summary(donation)
+```
+
+Number of blood donors.
+
+```{r}
+n_distinct(donation$sample)
+```
+
+```{r}
+g <- donation %>% 
+  filter(lubridate::as_date("1995-01-01") <= APPROX_DONATION_DATE) %>% # To get rid of long left tail
+  ggplot(aes(APPROX_DONATION_DATE)) + geom_histogram(bins=30) +
+  labs(title="Blood donations")
+min_bin_size(g)
+g
+```
+
+The area under the density curve is the number of successful Hb measurements.
+
+```{r}
+tmp <- donation %>% filter(!is.na(Hb)) 
+breaks <- cut_helper_variable_width(tmp, "Hb")$breaks
+g <- tmp %>% 
+  ggplot(aes(Hb)) + 
+  #geom_density(aes(y=after_stat(count), linetype="dotted"), key_glyph="path") + 
+  (if (allow_individual_level_data) 
+    geom_freqpoly(aes(linetype="solid")) else
+    geom_histogram(breaks = breaks)
+  ) +
+  #annotate("text", x=75, y=10000, label=glue("n={nrow(tmp)}")) +
+  annotate("text", x=I(0.25), y=I(0.5), label=glue("n={nrow(tmp)}")) +
+  labs(y=if_else(allow_individual_level_data, "Density", "Count"),
+       title="Hemoglobin measurements", subtitle="Variable width histogram") +
+  scale_linetype_identity(name = "Curve type",
+                          breaks = c("solid", "dotted"),
+                          labels = c("freqpoly", "density"),
+                          guide = "legend")
+min_bin_size(g)
+g
+```
+
+### Save extracted datas
+
+```{r}
+filename <- file.path(result_path, "all_datas.rds")
+if (! file.exists(filename) || recompute) {
+  L <- list(dosages=dosages, cohort=cohort, bd=bd, sex=sex, hc=hc, donation=donation)
+  saveRDS(L, filename)
+}
+```
+
+```{r, eval=FALSE}
+L <- readRDS(file.path(result_path, "all_datas.rds"))
+dosages <- L$dosages
+cohort <- L$cohort
+bd <- L$bd
+sex <- L$sex
+hc <- L$hc
+donation <- L$donation
+```
+
+## Analyze data
+
+Combine datasets.
+
+```{r}
+hc_full <- hc %>%
+  select(sample, hemochromatosis, age=AGE, approx_event_date = APPROX_EVENT_DAY) %>%
+  inner_join(bd, by="sample") %>%
+  inner_join(sex %>% rename(sex=SEX), by="sample") %>%
+  mutate(sex = as.factor(sex))
+filename <- file.path(result_path, "hemochromatosis_full.rds")
+if (! file.exists(filename) || recompute) {
+  saveRDS(hc_full, file=filename)
+}
+```
+
+
+```{r}
+hc_full %>% count(hemochromatosis) %>% mutate(freq = n / sum(n))
+```
+
+### Prevalences
+
+```{r}
+hc_full %>% 
+  count(sex) %>%
+  mutate(freq = n / sum(n),
+         label = sprintf("n=%i\n%.1f%%", n, freq*100)) %>%
+  ggplot(aes(sex, y=n, fill=sex)) + 
+  geom_col() + 
+  geom_text(aes(y=n/2, label=label))
+```
+
+```{r}
+part1 <- hc_full %>% 
+  mutate(blood_donor = if_else(blood_donor, "Blood donor", "Non-donor")) %>%
+  count(blood_donor, hemochromatosis, sex)
+part2 <-  hc_full %>%
+  mutate(blood_donor = "all") %>%
+  count(blood_donor, hemochromatosis, sex)
+tmp <- bind_rows(part1, part2) %>%
+  pivot_wider(names_from=sex, values_from=n) %>%
+  mutate(all = female + male) %>%
+  pivot_longer(cols=c(female, male, all), names_to = "sex", values_to = "n") %>%
+  group_by(sex, blood_donor) %>%
+  mutate(total=sum(n), freq = n/total) %>%
+  ungroup() %>%
+  mutate(label = sprintf("%i\n%.2f%%", n, freq*100))
+if (save_tables) {
+  # I should save also the denominator
+  filename <- file.path(table_path, "fg_prevalences.tsv")
+  write_tsv(tmp %>% 
+              filter(hemochromatosis == "case") %>% 
+              select(-hemochromatosis) %>% 
+              mutate(label = stringi::stri_escape_unicode(label)), # escape the newline characters
+            filename)
+}
+tmp %>%
+  ggplot(aes(sex, n, fill=sex)) + geom_col() + geom_text(aes(label=label)) +
+  scale_y_continuous(expand=expansion(mult=.15)) +
+  labs(y="Count", title="Case and control proportions in subgroups") +
+  facet_grid(hemochromatosis ~ blood_donor, scales = "free")
+```
+
+Test for equality of hemochromatosis prevalences in blood donors vs non-blood donors.
+
+```{r}
+donor_row <- tmp %>% filter(blood_donor =="Blood donor", sex=="all")
+non_donor_row <- tmp %>% filter(blood_donor =="Non-donor", sex=="all")
+counts <- tmp %>% filter(blood_donor %in% c("Blood donor", "Non-donor"), sex=="all")
+res <- prop.test(x = counts$n, n = counts$total)
+res
+```
+
+```{r}
+tidy(res)
+```
+
+The prevalences are significantly different.
+
+```{r}
+df <- dosages %>%
+  inner_join(bd, by="sample") %>%
+  inner_join(hc %>% select(sample, hemochromatosis), by="sample")
+```
+
+
+```{r}
+df_wide <- df %>% 
+  select(name, dosage, sample, blood_donor, hemochromatosis) %>% 
+  pivot_wider(names_from=name, values_from=dosage)
+```
+
+```{r}
+all_snips_wide <- hc_full %>%
+  inner_join(dosages_wide, by="sample") %>% 
+  inner_join(hla_snips, by="sample") %>% 
+  inner_join(credible_snips, by="sample")
+all_snips <- all_snips_wide %>%
+  pivot_longer(cols=-c(sample, blood_donor, hemochromatosis, age, approx_event_date, sex),
+               names_to="name", values_to="dosage")
+```
+
+### Linkage disequilibrium
+
+
+```{r}
+hla_order <- c("F*01:01", "F*01:03", "G*UTR-4", "G*01:01:01:05",  "G*010101c", "A*03:01", "C*07:02", "B*07:02", snip_order, 
+               hla_snip_names, credible_snip_names)
+```
+
+#### All
+
+```{r}
+ld_input_wide <- all_snips_wide %>% 
+  inner_join(hla_dosages_wide, by="sample")
+hla_pearson <- ld_input_wide %>% 
+  select(-c(sample, hemochromatosis, age, approx_event_date, blood_donor, sex)) %>% 
+  drop_na() %>% my_correlation(hla_order)
+hla_pearson %>% head()
+if (save_tables) {
+  filename <- file.path(table_path, "ld_among_all.tsv")
+  write_tsv(hla_pearson, filename)
+}
+g <- plot_correlation(hla_pearson) + theme(geom.text = element_geom(fontsize = 3), axis.text.x = element_text(angle = 45, hjust=1))
+if (save_figs) {
+  filename <- file.path(figure_path, "ld_among_all.pdf")
+  ggsave(filename, g, width=8, height=8)
+}
+g
+```
+
+Should this be done to haplotyped data instead?
+
+#### Cases
+
+```{r}
+hla_pearson_cases <- ld_input_wide %>% 
+  filter(hemochromatosis == "case") %>%
+  select(-c(sample, hemochromatosis, age, approx_event_date, blood_donor, sex)) %>% 
+  drop_na() %>% my_correlation(hla_order)
+hla_pearson_cases %>% head()
+if (save_tables) {
+  filename <- file.path(table_path, "ld_among_cases.tsv")
+  write_tsv(hla_pearson_cases, filename)
+}
+g <- plot_correlation(hla_pearson_cases) + 
+  labs(subtitle="Among cases") + 
+  theme(geom.text = element_geom(fontsize = 3), axis.text.x = element_text(angle = 45, hjust=1))
+if (save_figs) {
+  filename <- file.path(figure_path, "ld_among_cases.pdf")
+  ggsave(filename, g, width=8, height=8)
+}
+g
+```
+
+#### Controls
+
+```{r}
+hla_pearson_controls <- ld_input_wide %>% 
+  filter(hemochromatosis == "control") %>%
+  select(-c(sample, hemochromatosis, age, approx_event_date, blood_donor, sex)) %>% drop_na() %>% my_correlation(hla_order)
+hla_pearson_controls %>% head()
+if (save_tables) {
+  filename <- file.path(table_path, "ld_among_controls.tsv")
+  write_tsv(hla_pearson_controls, filename)
+}
+g <- plot_correlation(hla_pearson_controls) + 
+  labs(subtitle="Among controls") + 
+  theme(geom.text = element_geom(fontsize = 3), axis.text.x = element_text(angle = 45, hjust=1))
+if (save_figs) {
+  filename <- file.path(figure_path, "ld_among_controls.pdf")
+  ggsave(filename, g, width=8, height=8)
+}
+g
+```
+
+
+### Minor allele frequencies
+
+
+```{r}
+compute_mafs <- function(df, variables) {
+  df %>% 
+    group_by(across(all_of(variables))) %>% 
+    summarise(minor_allele_count = sum(dosage), allele_count = 2*n(), n = n(), .groups = "drop") %>%
+    mutate(minor_allele_freq = minor_allele_count / allele_count)
+}
+```
+
+```{r Minor allele frequencies}
+mafs <- compute_mafs(all_snips, "name")
+if (save_tables) {
+  filename <- file.path(table_path, "fg_mafs.tsv")
+  write_tsv(mafs, filename)
+}
+mafs
+```
+
+Stratify by hc status to enable comparison to UKBB data.
+
+```{r}
+group_by_variables2 <- c("name", "hemochromatosis")
+mafs_by_status <- compute_mafs(all_snips, group_by_variables2)
+if (save_tables) {
+  filename <- file.path(table_path, "fg_mafs_by_status.tsv")
+  write_tsv(mafs_by_status, filename)
+}
+mafs_by_status
+```
+
+
+```{r}
+mafs_by_status %>%
+  ggplot(aes(name, minor_allele_freq, fill=hemochromatosis)) + 
+  geom_col(position="dodge") +
+  labs(y="Minor allele frequency") + 
+  theme(axis.text.x = element_text(angle = 45))
+```
+
+Stratify by blood_donor status and hc status.
+
+
+```{r Minor allele frequencies in subgroups}
+group_by_variables <- c("name", "blood_donor", "hemochromatosis")
+mafs_by_status_and_bd <- compute_mafs(all_snips, group_by_variables)
+if (save_tables) {
+  filename <- file.path(table_path, "fg_mafs_by_status_and_bd.tsv")
+  write_tsv(mafs_by_status_and_bd, filename)
+}
+if (allow_individual_level_data)
+  mafs_by_status_and_bd
+```
+
+The minor allele frequencies are higher among blood donors, as noted in Jonna's paper.
+
+Test the difference in MAFs between bd and non-bd in cases.
+
+```{r}
+counts <- mafs_by_status_and_bd %>% filter(name == "C282Y", hemochromatosis == "case")
+counts %>% { prop.test(x = .$minor_allele_count, n = .$allele_count) }
+```
+
+Test the difference, ignore hemochromatosis status.
+
+```{r}
+counts <- mafs_by_status_and_bd %>% filter(name == "C282Y") %>% 
+  group_by(blood_donor) %>% summarise(across(c(minor_allele_count, allele_count, n), sum))
+counts %>% { prop.test(x = .$minor_allele_count, n = .$allele_count) }
+```
+
+```{r}
+if (allow_individual_level_data) {
+  mafs_by_status_and_bd %>%
+    mutate(blood_donor = if_else(blood_donor, "donor", "non-donor")) %>%
+    ggplot(aes(name, minor_allele_freq, fill=hemochromatosis)) + 
+    geom_col(position="dodge") +
+    facet_grid(. ~ blood_donor) +
+    labs(y="Minor allele frequency") +
+  theme(axis.text.x = element_text(angle = 45, vjust=1, hjust=1))
+}
+```
+
+### Dosage distributions
+
+```{r}
+compute_dosage_freqs <- function(df, variables) {
+  freqs <- df %>% 
+    group_by(across(all_of(variables))) %>%
+    count(dosage, name = "observed_count") %>%
+    ungroup() %>%
+    add_missing_combinations2("dosage", !!!variables) %>%   # Make implicit NAs explicit
+    replace_na(list(observed_count = 0)) %>%
+    group_by(across(all_of(variables))) %>%
+    mutate(total = sum(observed_count), observed_freq = observed_count / total) %>%
+    ungroup()
+  freqs
+}
+
+compute_expected_dosage_freqs <- function(maf) tibble(dosage=0:2, expected_freq=c((1-maf)**2, 2*(1-maf)*maf, maf**2))
+```
+
+```{r}
+expected_dosages <- mafs %>% mutate(value = map(minor_allele_freq, compute_expected_dosage_freqs)) %>% unnest(value) %>%
+  mutate(expected_count = expected_freq*n)
+all_snips %>% 
+  ggplot(aes(dosage)) + 
+  geom_bar() +
+  geom_point(data=expected_dosages, mapping=aes(x=dosage, y=expected_count), color="red") +
+  geom_text(aes(label=after_stat(count)), stat="count", vjust=-0.1) +
+  labs(subtitle="Red point is expected count due to MAF") +
+  facet_wrap(. ~ name)
+```
+
+Dosage counts and frequencies.
+
+```{r Dosage frequencies}
+compute_dosage_freqs(all_snips, "name")
+```
+
+
+
+Don't stratify by blood donor status in the downloadable version of the rendered report.
+
+
+
+
+
+
+```{r}
+#allow_individual_level_data2 <- allow_individual_level_data
+allow_individual_level_data2 <- FALSE   # Exception local to this chunk
+group_by_variables <- c("name", "blood_donor", "hemochromatosis")
+if (! allow_individual_level_data2)
+  group_by_variables <- setdiff(group_by_variables, "blood_donor")
+
+expected_dosages <- compute_mafs(all_snips, group_by_variables) %>% 
+  select(all_of(group_by_variables), minor_allele_freq) %>%
+  mutate(value = map(minor_allele_freq, compute_expected_dosage_freqs)) %>% 
+  unnest(value)
+compute_hwe <- function(v) {  # v should be a vector of integers of length 3
+  res <- gap::hwe(v, data.type = "count")
+  res$p.x2
+}
+observed_dosages <- compute_dosage_freqs(all_snips, group_by_variables)
+hwes <- observed_dosages %>% group_by(across(all_of(group_by_variables))) %>% 
+  summarise(hwe = compute_hwe(observed_count)) %>% ungroup() %>%
+  mutate(label = sprintf("hwe=%.1e", hwe),
+         color = if_else(hwe < 0.05, "red", "black"))
+
+# Save to joined dataframe
+filename <- file.path(table_path, "fg_dosage_maf.tsv")
+joined <- expected_dosages %>%
+  #rename(expected_freq = freq) %>%
+  left_join(observed_dosages, by=c("name", "hemochromatosis", "dosage")) %>% 
+  inner_join(hwes, by=c("name", "hemochromatosis")) %>%
+  filter(hemochromatosis == "case")
+if (save_tables)
+  write_tsv(joined, filename)
+#rm(joined)
+
+observed_dosages %>%
+  ggplot(aes(dosage, observed_freq, fill=(if (allow_individual_level_data2) blood_donor))) + 
+  geom_col(position="dodge") + 
+  geom_point(data = expected_dosages, aes(dosage, expected_freq), color="red", position=position_dodge(width=1)) + 
+  geom_text(aes(label=observed_count), vjust=0.5, hjust=0, position=position_dodge(width=1), angle=90) +
+  geom_text(data=hwes, mapping=aes(x=I(0.6), y=I(0.95), label = label, color=I(color))) +
+  scale_y_continuous(labels=scales::label_percent(), limits=c(0, 1), name="Percentage", expand = expansion(mult=c(0.05, 0.3))) +
+  labs(x="Dosage", fill="Is blood donor", subtitle="Red point is expected frequency due to MAF") + 
+  #lims(y=c(0, 100)) +
+  facet_grid(hemochromatosis ~ name)
+```
+
+Check that count are ok.
+
+```{r}
+joined %>% filter(observed_count < 5)
+```
+
+
+### HFE mutations among cases
+
+#### as a function in time
+
+```{r}
+equal_count_breaks <- function(v, n) {
+  v <- as.numeric(v)
+  ggplot2:::breaks(v, "numbers", n) %>% as_date()
+}
+equal_count_cut <- function(v, n) { 
+  brk <- equal_count_breaks(v, n)
+  cut(v, brk, include.lowest = TRUE)
+}
+mutations_in_time <- hc %>% 
+  filter(hemochromatosis == "case")  %>%
+  left_join(dosages_wide %>% select(sample, H63D, C282Y), by="sample") %>%
+  #mutate(.bin = cut(APPROX_EVENT_DAY, breaks = 10) %>% fct_relabel(sort)) %>%  # for some reason this did not give equal width bins?!
+  #mutate(.bin = cut_interval(APPROX_EVENT_DAY, n = 10)) %>%
+  mutate(.bin = equal_count_cut(APPROX_EVENT_DAY, n = 10)) %>%
+  mutate(C282Y_H63D_variation = (H63D + C282Y) > 0,
+    C282Y_variation = C282Y > 0,
+    C282Y_homozygote = C282Y == 2,
+    .by = .bin
+  )
+  # mutate(.bin = ntile(APPROX_EVENT_DAY, n = 10)) %>%
+  # group_by(.bin) %>%
+  # mutate(min_date = min(APPROX_EVENT_DAY), 
+  #   max_date = max(APPROX_EVENT_DAY),
+  #   .label = sprintf("%s - %s", min_date, max_date)) %>%
+  # ungroup()
+```
+
+```{r}
+my_levels <- c("C282Y_H63D_variation", "C282Y_variation", "C282Y_homozygote")
+mutation_rate <- function(df) {
+  df %>%
+    pivot_longer(cols = all_of(my_levels), values_to="value", names_to="term") %>%
+    summarise(estimate = mean(value), n = n(), .by = c(term, .bin))# %>%
+    #mutate(term = "mutation_rate")
+}
+```
+
+```{r}
+mutation_rate(mutations_in_time) %>% arrange(.bin)
+```
+
+```{r}
+set.seed(1)
+time_bootstrap <- rsample::bootstraps(mutations_in_time, times = 1000)
+
+time_stats <-
+  time_bootstrap %>%
+  mutate(stats = purrr::map(splits, ~ analysis(.x) %>% mutation_rate()))
+```
+
+```{r}
+time_ci2 <- rsample::int_pctl(time_stats, statistics = stats, alpha = 0.05)
+time_ci2
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 7
+
+annotations <- mutations_in_time %>% count(.bin) %>% 
+  mutate(term = factor("C282Y_H63D_variation", my_levels),
+    label = glue("n={n}"))
+time_ci <- time_ci2 %>%
+  left_join(annotations, by=c(".bin", "term"))
+if (save_tables) {
+  filename <- file.path(table_path, "variations_along_time.tsv")
+  write_tsv(time_ci, filename)
+}
+g <- time_ci %>%
+  #mutate(.bin = fct_rev(.bin)) %>%
+  mutate(term = fct_relevel(term, my_levels)) %>%
+  ggplot(aes(x = .bin, y = .estimate, ymin = .lower, ymax = .upper)) +
+  geom_hline(data=tibble(term = factor("C282Y_homozygote", my_levels)), mapping = aes(yintercept = 0.25), color = "red", ) + 
+  geom_pointrange() +
+  geom_line(aes(group = term)) +
+  geom_text(#data = annotations, 
+    mapping = aes(x=.bin, y = I(0.25), label = label), inherit.aes = FALSE) +
+  lims(y=0:1) + 
+  labs(y = "Variation frequency", x="Date", title = "Variation frequencies in C282Y and H63D SNPs among cases in time",
+    subtitle = "Equal-sized, variable-width bins",
+    caption = "Relative frequency of individuals among cases with the described variation.") +
+  facet_grid(term ~ ., labeller = as_labeller(c(C282Y_homozygote = "C282Y homozygote", 
+                                                C282Y_variation = "Any C282Y variant",
+                                                C282Y_H63D_variation = "Any C282Y or H63D\nvariant")))
+if (save_figs) {
+  filename <- file.path(figure_path, "variations_along_time.pdf")
+  ggsave(filename, g, width = 10, height = 5, units = "in")
+}
+g
+```
+
+There is not much variation in the mutation fraction.
+
+#### as a function of biobank
+
+```{r}
+mutations_in_place <- hc %>% 
+  filter(hemochromatosis == "case")  %>%
+  left_join(dosages_wide %>% select(sample, H63D, C282Y), by="sample") %>%
+  left_join(cohort) %>% 
+  mutate(.bin = fct_lump_min(cohort, min=10) %>% fct_relabel(sort)) %>%
+  #mutate(.bin = equal_count_cut(APPROX_EVENT_DAY, n = 10)) %>%
+  mutate(C282Y_H63D_variation = (H63D + C282Y) > 0,
+    C282Y_variation = C282Y > 0,
+    C282Y_homozygote = C282Y == 2,
+    .by = .bin
+  )
+```
+
+```{r}
+mutation_rate(mutations_in_place) %>% arrange(.bin)
+```
+
+```{r}
+set.seed(1)
+place_bootstrap <- bootstraps(mutations_in_place, times = 1000)
+
+place_stats <-
+  place_bootstrap %>%
+  mutate(stats = purrr::map(splits, ~ analysis(.x) %>% mutation_rate()))
+```
+
+```{r}
+place_ci <- int_pctl(place_stats, statistics = stats, alpha = 0.05)
+place_ci
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 5
+annotations <- mutations_in_place %>% count(.bin) %>% 
+  mutate(term = factor("C282Y_H63D_variation", my_levels),
+    label = glue("n={n}"))
+place_ci %>%
+  #mutate(.bin = fct_rev(.bin)) %>%
+  mutate(term = fct_relevel(term, my_levels)) %>%
+  ggplot(aes(x = .bin, y = .estimate, ymin = .lower, ymax = .upper)) +
+  geom_pointrange() +
+  geom_line(aes(group = term)) +
+  geom_text(data = annotations, 
+    mapping = aes(x=.bin, y = I(0.25), label = label), inherit.aes = FALSE) +
+  lims(y=0:1) + labs(y = "Variation rate", x="Biobank") +
+  labs(y = "Variation rate", x="Subcohort", title = "Variation rates of C282Y and H63D among cases in place") +
+    #subtitle = "Equal-sized bins") +
+  facet_grid(term ~ .) +
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+```
+
+### Snip combinations
+
+Cross table. I will not stratify by blood donor status as well since that would result in too small groups.
+
+```{r}
+snip_combinations <- function(df, snip1, snip2, filename=NULL) {
+  snip_names <- c(snip1, snip2)
+  wide <- df %>% 
+    filter(name %in% snip_names) %>% 
+    select(sample, name, dosage, hemochromatosis) %>% 
+    pivot_wider(names_from = name, values_from=dosage)
+  #print(wide)
+  correlations <- wide %>% group_by(hemochromatosis) %>% summarise(correlation = cor(.data[[snip1]], .data[[snip2]]))
+  correlations <- correlations %>% 
+    mutate(s = sprintf("%s: r=%.3f r^2=%.3f", hemochromatosis, correlation, correlation**2)) %>% 
+    pull(s) %>% 
+    paste(collapse="\n")
+  tmp <- wide %>%
+    mutate(across(-sample, as.factor)) %>%
+    count(.data[[snip1]], .data[[snip2]], hemochromatosis) %>%
+    group_by(hemochromatosis) %>%
+    mutate(total = sum(n),
+           freq = n / total,
+           label = sprintf("n=%i\n%.1f%%", n, freq*100)) %>%
+    ungroup()# %>%
+    #print()
+  #         label = glue("n={n}\n{format(freq*100, digits=1, scientific=FALSE, nsmall=1)}%"))
+  if (! is.null(filename) && save_tables)
+    write_tsv(tmp %>% mutate(label=stringi::stri_escape_unicode(label)), filename) # escape the newline characters
+  min_count <- min(tmp$n)
+  if (allow_individual_level_data || min_count >= 5) {
+  tmp %>%
+    ggplot(aes(x=.data[[snip1]], y=.data[[snip2]], fill=freq)) + 
+    geom_raster() + geom_text(aes(label=label), color="white") +
+    scale_fill_continuous(labels=scales::label_percent(), name="Frequency") +
+    labs(title="Dosage combinations", subtitle=correlations) +
+    facet_grid(~ hemochromatosis)
+  } else {
+    "Figure not shown as too low counts appear in it!"
+  }
+}
+```
+
+```{r}
+filename <- file.path(table_path, "fg_combinations_C282Y_H63D.tsv")
+snip_combinations(all_snips, "C282Y", "H63D", filename=filename)
+```
+
+```{r}
+snip_combinations(all_snips, "C282Y", "H1-2")
+```
+
+```{r}
+snip_combinations(all_snips, "H63D", "H1-2")
+```
+
+Non-C282Y snip carriers versus non-carries and cases and controls
+
+```{r}
+tmp <- df_wide %>% 
+  rowwise() %>% 
+  mutate(other = sum(`H1-2`, H63D, S65C, supersnip)) %>% 
+  ungroup() %>% 
+  mutate(C282Y = as.integer(C282Y > 0), other = as.integer(other > 0))
+tmp <- tmp %>% 
+  select(hemochromatosis, C282Y, other) %>%
+  mutate(hemochromatosis = as.integer(hemochromatosis=="case"))
+```
+
+```{r}
+tmp %>%
+  count(hemochromatosis, C282Y, other) %>%
+  group_by(C282Y) %>%
+  mutate(freq = n / sum(n),
+         label = sprintf("n=%i\n%.1f%%", n, freq*100)) %>%
+  ungroup() %>%
+  ggplot(aes(x=hemochromatosis, y=other, fill=freq)) + 
+  geom_raster() + 
+  geom_text(aes(label=label), color="white") +
+  scale_x_continuous(breaks=0:1, labels=c("control", "case")) +
+  scale_y_continuous(breaks=0:1) +
+  scale_fill_continuous(labels=scales::label_percent(), name="Frequency") +
+  labs(y="Carrier of any other snip") +
+  #labs(title="Dosage combinations", subtitle=correlations) +
+  facet_grid(~ C282Y, labeller = as_labeller(c(`0`="Non-C282Y-carrier", `1`="C282Y-carrier")))
+```
+
+### Penetrance
+
+Penetrance by individual variant.
+
+```{r}
+all_snips %>% group_by(name, dosage) %>% summarise(penetrance = mean(hemochromatosis=="case")) %>% ungroup()
+```
+
+Penetrance by variant pairs.
+
+```{r}
+penetrance <- function(df_wide, snp1, snp2) {
+  df_wide %>% 
+    group_by(.data[[snp1]], .data[[snp2]]) %>% 
+    summarise(penetrance = mean(hemochromatosis=="case"), .groups="drop") %>%
+    mutate(label = sprintf("%.1f%%", penetrance*100)) %>%
+    ggplot(aes(x=.data[[snp1]], y=.data[[snp2]], fill=penetrance)) +
+    geom_raster() +
+    geom_text(aes(label=label), color="white") +
+    scale_fill_continuous(labels=scales::label_percent(), name="Penetrance") +
+    labs(title="Penetrance")
+}
+```
+
+```{r}
+penetrance(all_snips_wide, "C282Y", "H63D")
+```
+
+```{r}
+penetrance(all_snips_wide, "C282Y", "H1-2")
+```
+
+```{r}
+penetrance(all_snips_wide, "H1-2", "H63D")
+```
+
+```{r}
+tibble(a=2:5) %>% rowwise() %>% mutate(b=list(1:(a-1))) %>% unnest(cols=b) %>%
+  pwalk(function(a, b) plot(penetrance(all_snips_wide, snip_names[a], snip_names[b])))
+```
+
+```{r}
+df_hla_wide <- df_wide %>% inner_join(hla_dosages_wide)
+```
+
+
+```{r}
+#penetrance(df_hla_wide, "C282Y", "F*01:01")
+penetrance(ld_input_wide, "C282Y", "F*01:01")
+```
+
+```{r}
+walk(hla_alleles %>% pull(allele), function(allele) plot(penetrance(ld_input_wide, "C282Y", allele)))
+```
+
+
+### Blood donation
+
+```{r}
+sdonation <- donation %>% 
+  group_by(sample) %>%
+  summarise(count = sum(status=="Whole_blood_donation"),
+            mean_Hb = mean(Hb, na.rm=TRUE)) %>% inner_join(sex, by="sample")
+```
+
+```{r}
+tmp <- sdonation %>% 
+  pivot_longer(cols=c(count, mean_Hb)) %>%
+  inner_join(hc, by="sample") %>%
+  filter(!(name=="mean_Hb" & value < 100)) # drop outlier
+breaks <- c("dashed", "solid")
+labels <- c("Density", "Frequency polygon")
+if (! allow_individual_level_data) {
+  breaks <- "dashed"
+  labels <- "Density"
+}
+counts <- tmp %>% count(SEX, hemochromatosis) %>% mutate(label = glue("n={n}")) # counts in facets
+tmp %>% ggplot(aes(value, color=SEX)) + 
+  (if (allow_individual_level_data) geom_freqpoly(aes(linetype="solid"), key_glyph="path")) +
+  geom_density(aes(y=after_stat(count), linetype="dashed"), key_glyph="path") + #c(color=TRUE, linetype=TRUE, fill=FALSE)) +
+  geom_text(data=counts %>% filter(SEX=="female"), mapping=aes(label=label), x = -Inf, y = Inf, hjust = 0, vjust = 2) +
+  geom_text(data=counts %>% filter(SEX!="female"), mapping=aes(label=label), x = -Inf, y = Inf, hjust = 0, vjust = 1) +
+  #annotate(geom = 'text', label = 'sometext', x = -Inf, y = Inf, hjust = 0, vjust = 1) +
+  scale_linetype_identity(#values = c("dashed", "solid"),
+                        breaks = breaks,
+                        labels = labels, 
+                        name="Line",
+                        #guide="legend"
+                        guide = guide_legend(override.aes = list(linetype = breaks))) +
+  labs(color="Sex", y=if_else(allow_individual_level_data, "count", "density")) +
+  facet_grid(hemochromatosis ~ name, scales = "free")
+```
+
+
+
+### Diagnoses before and after hemochromatosis
+
+These endpoints are from FinnGen R12 E4_IRON_MET CodeWAS analysis.
+
+```{r}
+# codewas <- c("E83.1", "TPH00", "SPAT1074", "M14.5*E83.1", "B99", "K76.0", "JJ2AT", "JN1AE", "TPW99", "K76.9", "K74.6", "E78.5", "FM1EE", "TPH00", "B04", "R74.0", "2750A", "GD1AA", "E87.1", "I85.9", "M14.5", "M16.1", "JN3AE", "B28", "G47.3", "UJD10", "K73.80", "G03BA03", "TPH04", "D75.1", "TJJ00", "R53", "JJ1LE", "XX1XT", "C22.0", "D83.1", "V03AC03", "E83.0", "C83.1", "JN1DG")
+
+```
+
+Read phenocodes and prettier phenotype names.
+
+```{r}
+# This contains only core endpoints:
+#filename <- "/finngen/library-green/finngen_R12/finngen_R12_analysis_data/finngen_R12_pheno_n.tsv"
+#phenotypes <- read_tsv(filename, col_select = c("phenotype", "phenocode", "category"))
+# This contains all endpoints, but no categories
+filename <- glue("/finngen/library-red/finngen_{Release}/phenotype_1.0/documentation/finngen_{Release}_endpoint_definitions_1.0.txt")
+phenotypes <- read_tsv(filename, col_select = c("NAME", "LONGNAME")) %>%
+  rename(phenocode = NAME, phenotype = LONGNAME)
+#phenotypes %>% head()
+```
+
+Read the medical codes and their descriptions.
+
+```{r}
+filename <- "/finngen/library-green/finngen_R9/finngen_R9_medical_codes/finngen_R9_medcode_ref.tsv"
+medical_codes <- read_tsv(filename)
+```
+
+```{r}
+tmp <- medical_codes %>% group_by(code) %>% filter(n() > 1) %>% ungroup()
+tmp %>% select(code_set) %>% table()
+```
+
+Read the drug codes.
+
+```{r}
+filename <- "/finngen/library-green/finngen_R6/finngen_R6_medical_codes/ATC_translate_minimal.txt"
+drug_names <- read_tsv(filename)
+```
+
+```{r}
+all_codes <- bind_rows(
+  medical_codes %>% select(code_set, CODE1=code, description=name_en) %>% distinct(),
+  # The observed code don't contain . in the ICD10 code, hence we drop it.
+  medical_codes %>% select(code_set, CODE1=code, description=name_en) %>% 
+    mutate(CODE1 = if_else(code_set=="ICD10", str_remove(CODE1, "\\."), CODE1)) %>% distinct(),
+  drug_names %>% select(CODE1=Id, description=Longname) %>% mutate(code_set = "ATC")
+)  %>% distinct()
+```
+
+Load most typical medical codes for hemochromatosis.
+
+```{r}
+filename <- file.path(data_path, "codewas_hemochromatosis_r11.tsv")
+best_codes <- read_tsv(filename)
+codewas <- best_codes$Code
+```
+
+```{r}
+cases <- hc %>% filter(hemochromatosis =="case")
+case_ids <- cases$sample
+```
+
+Check that the longitudinal endpoint file is sorted by the finngenids, with the exception of the first line.
+
+```{bash, eval=FALSE}
+dir=/finngen/library-red/finngen_R12/phenotype_1.0/data
+zcat $dir/finngen_R12_endpoint_longitudinal_1.0.txt.gz | cut -f 1 | tail -n+2 | uniq | sort -c
+```
+
+Check that the detailed longitudinal file is sorted, with the exception of the first line.
+
+```{bash, eval=FALSE}
+dir=/finngen/library-red/finngen_R12/phenotype_1.0/data
+zcat $dir/finngen_R12_detailed_longitudinal_1.0.txt.gz | cut -f 1 | tail -n+2 | uniq | sort -c
+```
+
+If nothing is printed, then the file is sorted according to the first field.
+
+Create helper file with all FINNGEN ids in alphabetical order we are interested in.
+
+```{r}
+df2 <- tibble(FINNGENID=sort(case_ids))
+write_tsv(df2, "/tmp/keys.tsv")
+```
+
+Join the two files according the first field. This does not work unless the keys are sorted.
+
+```{bash}
+. ../data/bash_init  # Read some bash variables
+if [[ $release == "r12" ]] ; then 
+  input=/finngen/library-red/finngen_R12/phenotype_1.0/data/finngen_R12_endpoint_longitudinal_1.0.txt.gz
+else
+  input=/finngen/library-red/finngen_R13/phenotype_1.0/data/finngen_R13_endpoint_longitudinal_1.0.txt.gz
+fi
+output=$result_path/diagnoses_of_hc_cases.tsv.gz
+if [[ ! -f $output ]] ; then
+  zcat $input | join -t $'\t' -j 1 /tmp/keys.tsv - | gzip > $output
+fi
+```
+
+Join the two files according the first field. Now with detailed longitudinal data.
+
+```{bash}
+. ../data/bash_init  # Read some bash variables
+if [[ $release == "r12" ]] ; then 
+  input=/finngen/library-red/finngen_R12/phenotype_1.0/data/finngen_R12_detailed_longitudinal_1.0.txt.gz
+else
+  input=/finngen/library-red/finngen_R13/phenotype_1.0/data/finngen_R13_detailed_longitudinal_1.0.txt.gz
+fi
+output=$result_path/detailed_diagnoses_of_hc_cases.tsv.gz
+if [[ ! -f $output ]] ; then
+  zcat $input | join -t $'\t' -j 1 /tmp/keys.tsv - | gzip > $output
+fi
+```
+
+
+
+Read the diagnoses for the individuals with hemochromatosis cases.
+
+```{r}
+filename <- file.path(result_path, "diagnoses_of_hc_cases.tsv.gz")
+other_diagnoses <- read_tsv(filename)
+other_diagnoses <- other_diagnoses %>% 
+  rename(sample=FINNGENID) %>% 
+  inner_join(cases %>% select(sample, first_hc_date=APPROX_EVENT_DAY), by="sample") %>%
+  left_join(phenotypes, by=c(ENDPOINT="phenocode"))
+```
+
+Read the medical codes for the individuals with hemochromatosis cases.
+These contain other codes in addition to diagnoses.
+
+```{r}
+filename <- file.path(result_path, "detailed_diagnoses_of_hc_cases.tsv.gz")
+other_codes_orig <- read_tsv(filename)  %>% 
+  rename(sample=FINNGENID)
+other_codes <- other_codes_orig %>% 
+  inner_join(cases %>% select(sample, first_hc_date=APPROX_EVENT_DAY), by="sample") %>%
+  mutate(type = str_remove(CATEGORY, "[0-9]+$"),
+         code_set = case_when(SOURCE == "PURCH" ~ "ATC",
+                              type == "" | type == "ICD"   ~ glue("ICD{ICDVER}"),
+                              TRUE ~ type))
+```
+
+```{r}
+other_codes_orig %>% filter(is.na(CATEGORY)) %>% select(SOURCE, ICDVER) %>% table()
+```
+
+```{r}
+diagnoses_before <- other_diagnoses %>% 
+  filter(APPROX_EVENT_DAY < first_hc_date)
+diagnoses_after <- other_diagnoses %>% 
+  filter(APPROX_EVENT_DAY > first_hc_date)
+diagnoses_before_ever <- diagnoses_before %>% 
+  select(sample, ENDPOINT, phenotype) %>%
+  distinct()
+diagnoses_after_ever <- diagnoses_after %>% 
+  select(sample, ENDPOINT, phenotype) %>%
+  distinct()
+```
+
+```{r}
+codes_before <- other_codes %>% 
+  filter(APPROX_EVENT_DAY < first_hc_date)
+codes_after <- other_codes %>% 
+  filter(APPROX_EVENT_DAY > first_hc_date)
+codes_before_ever <- codes_before %>% 
+  select(sample, code_set, CODE1) %>%
+  distinct()
+codes_after_ever <- codes_after %>% 
+  select(sample, code_set, CODE1) %>%
+  distinct()
+```
+
+
+
+These functions find for each individual and diagnosis or medical code the min, median and max
+distance to the hc diagnosis.
+
+```{r}
+helper_diagnosis <- function(df) {
+  sign <- if_else(df$APPROX_EVENT_DAY < df$first_hc_date, +1, -1)
+  df %>% mutate(distance_in_years = sign*interval(APPROX_EVENT_DAY, first_hc_date) / dyears(1)) %>%
+    distinct() %>%
+    group_by(sample, ENDPOINT, phenotype) %>%
+    summarise(min = min(distance_in_years), max=max(distance_in_years), median=median(distance_in_years),
+              .groups="drop") %>%
+    ungroup()
+}
+helper_code <- function(df) {
+  sign <- if_else(df$APPROX_EVENT_DAY < df$first_hc_date, +1, -1)
+  df %>% mutate(distance_in_years = sign*interval(APPROX_EVENT_DAY, first_hc_date) / dyears(1)) %>%
+    distinct() %>%
+    group_by(sample, CODE1) %>%
+    summarise(min = min(distance_in_years), max=max(distance_in_years), median=median(distance_in_years),
+              .groups="drop") %>%
+    ungroup()
+}
+```
+
+```{r}
+limit <- if_else(allow_individual_level_data, 0, 5)
+```
+
+#### Before
+
+How many individuals have had a diagnosis before the first hc diagnosis?
+
+```{r}
+prior_diagnoses_counts <- diagnoses_before_ever %>% 
+  count(ENDPOINT, phenotype) %>% 
+  mutate(ENDPOINT=fct_reorder(ENDPOINT, n, .desc = TRUE),
+         phenotype=fct_reorder(phenotype, n, .desc = TRUE)) %>% 
+  arrange(desc(n)) %>% 
+  filter(n >= limit)# %>% head()
+filename <- file.path(table_path, "prior_diagnoses_counts.tsv")
+if (save_tables)
+  write_tsv(prior_diagnoses_counts, filename)
+most_common_prior_diagnoses <- prior_diagnoses_counts %>% slice_head(n=20)
+most_common_prior_diagnoses %>% select(phenotype, n)
+```
+
+How many individuals have had a medical code before the first hc diagnosis?
+
+```{r}
+prior_codes_counts <- codes_before_ever %>% 
+  count(CODE1, code_set) %>% 
+  left_join(all_codes %>% select(code_set, CODE1, description), by=c("CODE1", "code_set")) %>%
+  mutate(ENDPOINT=fct_reorder(CODE1, n, .desc = TRUE),
+         description=fct_reorder(description, n, .desc = TRUE)) %>% 
+  arrange(desc(n)) %>% 
+  filter(n >= limit) %>% # %>% head()
+  left_join(best_codes %>% drop_na(Description) %>% mutate(Code=str_remove(Code, "\\.")), by=c(CODE1="Code")) %>%
+  select(code_set, CODE1, description, n, "Odds ratio", mlog10p)
+filename <- file.path(table_path, "prior_codes_counts.tsv")
+if (save_tables)
+  write_tsv(prior_codes_counts, filename)
+most_common_prior_codes <- prior_codes_counts %>% slice_head(n=20)
+most_common_prior_codes #%>% left_join(best_codes %>% select(Vocabulary, "Odds ratio", mlog10p), by=c(CODE1="Code")) %>% View()
+```
+
+```{r}
+diagnoses_before_raw <- helper_diagnosis(diagnoses_before)
+tmp <- diagnoses_before_raw %>%
+  group_by(ENDPOINT, phenotype) %>% 
+  summarise(across(c(min, max, median), mean), .groups="drop") %>% 
+  pivot_longer(cols=c(min, max, median)) 
+tmp %>% ggplot(aes(value, color=name)) + 
+  (if (allow_individual_level_data) geom_freqpoly() else geom_density(key_glyph="path")) +
+  labs(x="Mean of distance in years", title="Diagnoses prior to the first hemochromatosis",
+       color = "Personal distance")
+```
+
+
+```{r, fig.height=8, fig.width=7}
+diagnoses_before_raw %>% 
+  filter(ENDPOINT %in% most_common_prior_diagnoses$ENDPOINT) %>%
+  mutate(phenotype = factor(phenotype, levels=levels(most_common_prior_diagnoses$phenotype))) %>%
+#  mutate(ENDPOINT = factor(ENDPOINT, levels=levels(most_common_prior_diagnoses$ENDPOINT)),
+#         phenotype = fct_reorder(phenotype, ENDPOINT)) %>%
+  #mutate(phenotype = coalesce(phenotype, ENDPOINT)) %>%
+  mutate(phenotype = fct_rev(phenotype)) %>%
+#  ggplot(aes(y=phenotype, x=value, color=name)) + 
+  ggplot(aes(y=phenotype, x=median)) + 
+  #geom_point() +
+  geom_boxplot(outliers=allow_individual_level_data) +
+  scale_y_discrete(labels=scales::label_wrap(40)) +
+  labs(title="Diagnoses before first hemochromatosis event", x="Distance in years", y="Phenotype") +
+  theme(legend.position = "bottom")
+```
+
+```{r}
+codes_before_raw <- helper_code(codes_before)
+tmp <- codes_before_raw %>%
+  group_by(CODE1) %>% 
+  summarise(across(c(min, max, median), mean), .groups="drop") %>% 
+  pivot_longer(cols=c(min, max, median)) 
+tmp %>% ggplot(aes(value, color=name)) + 
+  (if (allow_individual_level_data) geom_freqpoly() else geom_density(key_glyph="path")) +
+  labs(x="Mean of distance in years", title="Codes prior to the first hemochromatosis",
+       color = "Personal distance")
+```
+
+```{r, fig.height=8, fig.width=7}
+g <- codes_before_raw %>% 
+  filter(CODE1 %in% codewas) %>%
+  #inner_join(best_codes, by="Description") %>%
+  left_join(best_codes %>% drop_na(Description) %>%mutate(Code = str_remove(Code, "\\.")), by=c(CODE1="Code")) %>%
+  mutate(Description = fct_reorder(Description, mlog10p)) %>%
+#  mutate(ENDPOINT = factor(ENDPOINT, levels=levels(most_common_prior_diagnoses$ENDPOINT)),
+#         phenotype = fct_reorder(phenotype, ENDPOINT)) %>%
+  #mutate(phenotype = coalesce(phenotype, ENDPOINT)) %>%
+  #mutate(phenotype = fct_rev(phenotype)) %>%
+#  ggplot(aes(y=phenotype, x=value, color=name)) + 
+  ggplot(aes(y=Description, x=median)) + 
+  #geom_point() +
+  geom_boxplot(outliers=allow_individual_level_data) +
+  scale_y_discrete(labels=scales::label_wrap(40)) +
+  labs(title="Codes before first hemochromatosis event", x="Distance in years", y="Description") +
+  theme(legend.position = "bottom")
+g
+if (save_figs) {
+  filename <- file.path(figure_path, "codes_before_hc.pdf")
+  ggsave(filename, g)
+}
+```
+
+#### After
+
+```{r}
+after_diagnoses_counts <- diagnoses_after_ever %>% 
+  count(ENDPOINT, phenotype) %>% 
+  mutate(ENDPOINT=fct_reorder(ENDPOINT, n, .desc = TRUE),
+         phenotype=fct_reorder(phenotype, n, .desc = TRUE)) %>% 
+  arrange(desc(n)) %>% 
+  filter(n >= limit)# %>% head()
+filename <- file.path(table_path, "after_diagnoses_counts.tsv")
+if (save_tables)
+  write_tsv(after_diagnoses_counts, filename)
+most_common_after_diagnoses <- after_diagnoses_counts %>% slice_head(n=20)
+most_common_after_diagnoses %>% select(phenotype, n)
+```
+
+How many individuals have had a medical code after the first hc diagnosis?
+
+```{r}
+after_codes_counts <- codes_after_ever %>% 
+  count(CODE1, code_set) %>% 
+  left_join(all_codes %>% select(CODE1, code_set, description), by=c("CODE1", "code_set")) %>%
+  mutate(ENDPOINT=fct_reorder(CODE1, n, .desc = TRUE),
+         description=fct_reorder(description, n, .desc = TRUE)) %>% 
+  arrange(desc(n)) %>% 
+  filter(n >= limit) %>% # %>% head()
+  left_join(best_codes %>% drop_na(Description) %>% mutate(Code=str_remove(Code, "\\.")), by=c(CODE1="Code")) %>%
+  select(code_set, CODE1, description, n, "Odds ratio", mlog10p)
+filename <- file.path(table_path, "after_codes_counts.tsv")
+if (save_tables)
+  write_tsv(after_codes_counts, filename)
+most_common_after_codes <- after_codes_counts %>% slice_head(n=20)
+most_common_after_codes
+```
+
+```{r}
+diagnoses_after_raw <- helper_diagnosis(diagnoses_after)
+tmp <- diagnoses_after_raw %>%
+  group_by(ENDPOINT, phenotype) %>% 
+  summarise(across(c(min, max, median), mean), .groups="drop") %>% 
+  pivot_longer(cols=c(min, max, median)) 
+tmp %>% ggplot(aes(value, color=name)) + 
+  (if (allow_individual_level_data) geom_freqpoly() else geom_density(key_glyph="path")) +
+  labs(x="Mean of distance in years", title="Diagnoses after the first hemochromatosis",
+       color = "Personal distance")
+
+```
+
+```{r, fig.height=8, fig.width=7}
+diagnoses_after_raw %>% 
+  filter(ENDPOINT %in% most_common_after_diagnoses$ENDPOINT) %>%
+  mutate(phenotype = factor(phenotype, levels=levels(most_common_after_diagnoses$phenotype))) %>%
+#  mutate(ENDPOINT = factor(ENDPOINT, levels=levels(most_common_prior_diagnoses$ENDPOINT)),
+#         phenotype = fct_reorder(phenotype, ENDPOINT)) %>%
+  #mutate(phenotype = coalesce(phenotype, ENDPOINT)) %>%
+  mutate(phenotype = fct_rev(phenotype)) %>%
+#  ggplot(aes(y=phenotype, x=value, color=name)) + 
+  ggplot(aes(y=phenotype, x=median)) + 
+  #geom_point() +
+  geom_boxplot(outliers=allow_individual_level_data) +
+  scale_y_discrete(labels=scales::label_wrap(40)) +
+  labs(title="Diagnoses after first hemochromatosis event", x="Distance in years", y="Phenotype") +
+  theme(legend.position = "bottom")
+```
+
+```{r}
+codes_after_raw <- helper_code(codes_after)
+tmp <- codes_after_raw %>%
+  group_by(CODE1) %>% 
+  summarise(across(c(min, max, median), mean), .groups="drop") %>% 
+  pivot_longer(cols=c(min, max, median)) 
+tmp %>% ggplot(aes(value, color=name)) + 
+  (if (allow_individual_level_data) geom_freqpoly() else geom_density(key_glyph="path")) +
+  labs(x="Mean of distance in years", title="Codes after the first hemochromatosis",
+       color = "Personal distance")
+```
+
+```{r, fig.height=8, fig.width=7}
+g <- codes_after_raw %>% 
+  filter(CODE1 %in% codewas) %>%
+  #inner_join(best_codes, by="Description") %>%
+  left_join(best_codes %>% drop_na(Description) %>% 
+              mutate(Code = str_remove(Code, "\\.")), by=c(CODE1="Code")) %>%
+  mutate(Description = fct_reorder(Description, mlog10p)) %>%
+#  mutate(ENDPOINT = factor(ENDPOINT, levels=levels(most_common_prior_diagnoses$ENDPOINT)),
+#         phenotype = fct_reorder(phenotype, ENDPOINT)) %>%
+  #mutate(phenotype = coalesce(phenotype, ENDPOINT)) %>%
+  #mutate(phenotype = fct_rev(phenotype)) %>%
+#  ggplot(aes(y=phenotype, x=value, color=name)) + 
+  ggplot(aes(y=Description, x=median)) + 
+  #geom_point() +
+  geom_boxplot(outliers=allow_individual_level_data) +
+  scale_y_discrete(labels=scales::label_wrap(40)) +
+  labs(title="Codes after first hemochromatosis event", x="Distance in years", y="Description") +
+  theme(legend.position = "bottom")
+g
+if (save_figs) {
+  filename <- file.path(figure_path, "codes_after_hc.pdf")
+  ggsave(filename, g)
+}
+```
+
+Save diagnoses/code counts to excel file.
+
+```{r}
+dfs <- list(`Prior codes`=prior_codes_counts, `Posterior codes`=after_codes_counts,
+            `Prior diagnoses`=prior_diagnoses_counts, `Posterior diagnoses`=after_diagnoses_counts)
+filename <- file.path(table_path, "code_counts.xlsx")
+if (save_tables)
+  openxlsx::write.xlsx(dfs, file = filename, overwrite=TRUE)
+```
+
+### Survival models between endpoints before and after, done by FinnGen
+
+This data is downloaded from here
+https://r10.risteys.finngen.fi/endpoints/E4_IRON_MET
+For later releases the survival results are not downloadable.
+
+```{r}
+hazards <- read_csv(file.path(data_path, "E4_IRON_MET_survival-analyses-1.csv"))
+```
+
+```{r}
+hazards <- hazards %>% filter(outcome_name == "E4_IRON_MET")
+```
+
+Let's check top 10 prior phenotypes with highest adjusted p-value.
+
+```{r}
+top10 <- hazards %>% filter(hr_lag > 0) %>% mutate(p_adjusted_BY = p.adjust(p, method="BY")) %>% 
+  filter(p_adjusted_BY < 0.05) %>% arrange(p) %>% group_by(prior_name) %>% slice_head(n=1) %>% ungroup() %>% head(n=10)
+top10
+```
+
+
+
+
+
+```{r}
+prior_endpoint_df <- top10
+prior_endpoints <- prior_endpoint_df$prior_name
+prior_endpoint_df
+```
+
+Let's get all the events for these endpoints.
+
+```{r}
+input_filename <- if (release == "r12") "/finngen/library-red/finngen_R12/phenotype_1.0/data/finngen_R12_endpoint_longitudinal_1.0.txt.gz" else "/finngen/library-red/finngen_R13/phenotype_1.0/data/finngen_R13_endpoint_longitudinal_1.0.txt.gz"
+
+#input_filename <- "/finngen/library-red/finngen_R12/phenotype_1.0/data/finngen_R12_endpoint_longitudinal_1.0.txt.gz"
+output_filename <- file.path(result_path, "prior_endpoint_events_new.tsv.gz")
+comparisons <- paste(sprintf('$6 == "%s"', prior_endpoints), collapse=" || ")
+cmd <- sprintf('zcat %s | awk -F "\t" -v OFS="\t" \'NR==1{print}NR>1{if (%s) print}\' | gzip > %s', 
+               input_filename, comparisons, output_filename)
+cat(cmd)
+if (! file.exists(output_filename))
+  system(cmd)
+```
+
+Careful!!!!!! If you copy paste the above, make sure the tabulators are copied
+as well!!!!!!!!!!!!!
+
+This took about 15 minutes.
+
+```{r}
+prior_endpoint_events <- read_tsv(output_filename, n_max = Inf) %>% rename(sample=FINNGENID)
+```
+
+```{r}
+prior_endpoint_events <- prior_endpoint_events %>%
+  inner_join(prior_endpoint_df %>% select(prior_name, hr_lag), by=c(ENDPOINT="prior_name"))
+```
+
+Should I truncate the followup time so that each register would have the same followup time?
+
+I could also compute end of followup based on APPROX_BIRTH_DATE and AGE_AT_DEATH_OR_END_OF_FOLLOWUP. Let's do that!
+
+```{r}
+if (release == "r12") {
+  filename <- "/finngen/library-red/finngen_R12/analysis_covariates/R12_COV_V2.FID.txt.gz"
+} else {
+  filename <- "/finngen/library-red/finngen_R13/analysis_covariates/data/R13_COV_V0.FID.txt.gz"
+}
+covariates <- read_tsv(filename, col_select = c("FID", "APPROX_BIRTH_DATE", "AGE_AT_DEATH_OR_END_OF_FOLLOWUP")) %>%
+  rename(sample=FID)
+```
+
+```{r}
+covariates <- covariates %>% 
+  #head(n=100) %>% 
+  mutate(end_of_followup = APPROX_BIRTH_DATE + 365*AGE_AT_DEATH_OR_END_OF_FOLLOWUP)
+```
+
+```{r}
+hc2 <- hc %>% 
+  left_join(covariates %>% select(sample, end_of_followup), by="sample") %>%
+  mutate(event_or_eof_date = coalesce(APPROX_EVENT_DAY, end_of_followup)) %>%
+  drop_na(event_or_eof_date)
+```
+
+```{r}
+prior_endpoint_events <- prior_endpoint_events %>%
+  inner_join(hc2 %>% select(sample, end_of_followup), by="sample")
+```
+
+The exposure must start hr_lag years before the first hemochromatosis event.
+
+Here I think on purpose I use end_of_followup for all instead of event_or_eof_date.
+
+```{r}
+prior_endpoint_events <- prior_endpoint_events %>% 
+  mutate(threshold = end_of_followup - years(hr_lag))
+prior_endpoint_events <- prior_endpoint_events %>% filter(APPROX_EVENT_DAY < threshold)
+```
+
+```{r}
+prior_endpoint_events %>% select(sample, ENDPOINT) %>% distinct() %>% count(ENDPOINT)
+```
+
+Count the event only once.
+
+```{r}
+prior_endpoint_events2 <- prior_endpoint_events %>% select(sample, ENDPOINT) %>% distinct()
+```
+
+```{r}
+prior_disease_events <- prior_endpoint_events2 %>% 
+  mutate(value = TRUE) %>% 
+  pivot_wider(values_from="value", names_from="ENDPOINT") %>% 
+  mutate(across(-sample, ~ replace_na(., FALSE)))
+filename <- file.path(result_path, "prior_disease_events.tsv")
+if (save_tables)
+  write_tsv(prior_disease_events, filename)
+```
+
+### Event age distribution
+
+```{r}
+all <- dosages %>% 
+  select(sample, dosage, name) %>% 
+  pivot_wider(names_from=name, values_from=dosage) %>% 
+  inner_join(hc_full, by="sample")
+```
+
+```{r}
+tmp <- all %>% 
+  filter(hemochromatosis == "case")
+if (allow_individual_level_data) {
+  #breaks <- tmp %>% filter(C282Y == 2 & sex == "female") %>% pull(age) %>% cut_helper_variable_width(number_of_breaks = 15) %>% .$breaks
+  g <- tmp %>%
+    ggplot(aes(age, color=sex)) + 
+    geom_density(key_glyph = "path") +
+    #geom_freqpoly(breaks = breaks) +
+    (if (allow_individual_level_data) geom_rug()) +
+    geom_text(data=tmp %>% count(C282Y, sex) %>% mutate(label=sprintf("n=%i",n), y=if_else(sex=="male", 0.8, 0.9)),
+              mapping=aes(x=I(0.1), y=I(y), label=label),
+              hjust = 0, show.legend = FALSE) +
+    labs(x="Event age", y="Density", color="Sex", title=sprintf("%i hemochromatosis cases", nrow(tmp))) +
+    facet_grid(C282Y ~ ., labeller=label_both)
+  #min_bin_size(g)
+  g
+} else {
+  # This looks like a mess, so I won't show it.
+  if (FALSE) {
+  helper <- function(tmp2, dosage) {
+    tmp <- tmp2 %>% filter(C282Y == dosage)
+    breaks <- tmp %>% group_by(sex) %>% cut_helper_variable_width("age") %>% pluck("breaks")
+    g <- tmp %>%
+    ggplot(aes(age, fill=sex)) + 
+    geom_histogram(breaks = breaks, position="identity", alpha=0.5) +
+    geom_text(data=tmp %>% count(sex) %>% mutate(label=sprintf("n=%i",n), y=if_else(sex=="male", 0.8, 0.9)),
+    mapping=aes(x=I(0.1), y=I(y), label=label),
+    hjust = 0, show.legend = FALSE) +
+    labs(x="Event age", y="Count", color="Sex", title=sprintf("%i hemochromatosis cases", nrow(tmp)))
+    g
+  }
+  g0 <- helper(tmp, dosage = 0)
+  g1 <- helper(tmp, dosage = 1)
+  g2 <- helper(tmp, dosage = 2)
+  g0 / g1 / g2
+  }
+  "Figure not shown as it contains individual level data"
+}
+
+```
+
+
+
+
+
+
+
+
+
+
+

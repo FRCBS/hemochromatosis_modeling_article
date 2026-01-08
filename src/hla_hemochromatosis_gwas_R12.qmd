@@ -1,0 +1,399 @@
+---
+title: "HLA hemochromatos gwas R12"
+author: "Jarkko Toivonen"
+format: html
+---
+
+## Setup
+
+```{r setup}
+library(tidyverse)
+library(glue)
+library(ggrepel)
+result_path <- "../results"
+figure_path <- file.path(result_path, "figures")
+hc_red <- "gs://fg-production-sandbox-5-red/toivoja/hemochromatosis"
+save_figs <- FALSE
+```
+
+## Functions
+
+Get gene order.
+
+```{r}
+# Jonna's order
+#hla_order <- c("F", "G", "A", "E", "C", "B", "MICA", "MICB", "DRB5", "DRB3", "DRB1", "DRB4", "DQA1", "DQB1", "DPB1")
+# Order from Degenhardt (2019)
+hla_order <- c("F", "G", "A", "E", "C", "B", "MICA", "MICB", "DRB3", "DRB5", "DRB4", "DRB1", "DQA1", "DQB1", "DPB1")
+# hla_genes <- read_tsv("../data/extended_hla.tsv")  # Does not contain all gene names
+# hla_genes <- hla_genes %>% 
+#   filter(`Gene name` != "HFE") %>%
+#   group_by(`Gene name`) %>%
+#   slice_min(order_by=`Gene start (bp)`, n=1) %>%  # For some reason HLA-DRB6 was listed twice
+#   ungroup() %>%
+#   arrange(`Gene start (bp)`)
+# hla_order <- str_remove(hla_genes$`Gene name`, "^HLA-")
+# hla_order
+```
+
+```{r}
+# Split the ID column into gene and allele parts
+cleanup <- function(results, hla_order) {
+  df <- results %>% 
+    #bind_rows(.id="id") %>%   # Previously I ran the HLA genes in two parts
+    separate_wider_delim(col=ID, delim="*", names = c("gene", "allele")) %>%
+    mutate(gene = factor(gene, levels=hla_order)) %>%
+    droplevels()
+  df
+}
+hla_manhattan_plot <- function(df) {
+  #df <- helper(results, hla_order)
+  significance_level <- -log10(0.05 / nrow(df))
+  to_annotate <- df %>% filter(LOG10P > significance_level)
+  g <- df %>% 
+    mutate(color = factor(case_when(
+      BETA > 0 ~ "red",
+      BETA < 0 ~ "blue",
+      TRUE  ~ "black"
+           ), levels=c("blue", "black", "red"))) %>%
+    ggplot(aes(x=as.integer(gene)-0.25, y=LOG10P, color=color)) + 
+    geom_hline(yintercept = significance_level, linetype="dotted") +
+    geom_segment(aes(xend = as.integer(gene)+0.25), alpha=0.5) +
+    geom_text_repel(data=to_annotate, mapping=aes(x=as.integer(gene)+0.3, y=LOG10P, label=allele), 
+                    box.padding=0, force=0.5, force_pull = 100, hjust=0, vjust=0.5, direction="y", size=2.5, inherit.aes = FALSE) +
+    #geom_text(data=to_annotate, mapping=aes(x=as.integer(gene)+0.3, y=LOG10P, label=allele), hjust=0, 
+    #          position=position_jitter(width=0), direction="y", size=2.5) +
+    scale_x_continuous(breaks = 1:length(levels(df$gene)), labels = levels(df$gene)) +
+    scale_discrete_identity(guide = "legend",
+                         aesthetics = "color",
+                         name = "Beta",
+                         drop = FALSE,
+                         labels = c("negative", "zero", "positive"),
+                         #values = c("blue", "black", "red"),
+                         breaks = c("blue", "black", "red")) +
+    labs(x="Gene", y=expression(-log[10](p)))
+  g
+}
+```
+
+## Create the pheno cov file
+
+```{r}
+covariate_string <- "SEX_IMPUTED,AGE_AT_DEATH_OR_END_OF_FOLLOWUP,PC{1:10},IS_FINNGEN2_CHIP,BATCH_DS1_BOTNIA_Dgi_norm,BATCH_DS10_FINRISK_Palotie_norm,BATCH_DS11_FINRISK_PredictCVD_COROGENE_Tarto_norm,BATCH_DS12_FINRISK_Summit_norm,BATCH_DS13_FINRISK_Bf_norm,BATCH_DS14_GENERISK_norm,BATCH_DS15_H2000_Broad_norm,BATCH_DS16_H2000_Fimm_norm,BATCH_DS17_H2000_Genmets_norm_relift,BATCH_DS18_MIGRAINE_1_norm_relift,BATCH_DS19_MIGRAINE_2_norm,BATCH_DS2_BOTNIA_T2dgo_norm,BATCH_DS20_SUPER_1_norm_relift,BATCH_DS21_SUPER_2_norm_relift,BATCH_DS22_TWINS_1_norm,BATCH_DS23_TWINS_2_norm_nosymmetric,BATCH_DS24_SUPER_3_norm,BATCH_DS25_BOTNIA_Regeneron_norm,BATCH_DS26_DIREVA_norm,BATCH_DS27_NFBC66_norm,BATCH_DS28_NFBC86_norm,BATCH_DS3_COROGENE_Sanger_norm,BATCH_DS4_FINRISK_Corogene_norm,BATCH_DS5_FINRISK_Engage_norm,BATCH_DS6_FINRISK_FR02_Broad_norm_relift,BATCH_DS7_FINRISK_FR12_norm,BATCH_DS8_FINRISK_Finpcga_norm,BATCH_DS9_FINRISK_Mrpred_norm"
+covariate_string <- str_replace(covariate_string, fixed("PC{1:10}"), glue("PC{1:10}") %>% paste(collapse=","))
+covariates <- str_split_1(covariate_string, pattern = ",")
+```
+
+```{r}
+wanted_column_names <- c("FID", "IID", covariates, "E4_IRON_MET")
+```
+
+```{r}
+cov_pheno_filename <- "/finngen/library-red/finngen_R12/analysis_covariates/R12_COV_PHENO_V2.FID.txt.gz"
+tmp <- read_tsv(cov_pheno_filename, n_max = 0)
+column_names <- colnames(tmp)
+```
+
+Which column to extract, as indices.
+
+```{r}
+wanted_col_indices <- which(column_names %in% wanted_column_names)
+```
+
+Extract the columns from the pheno cov file.
+
+```{r}
+cmd <- glue("zcat {cov_pheno_filename} | cut -f {paste(wanted_col_indices, collapse=',')} | gzip > /tmp/cov_pheno.tsv.gz")
+print(cmd)
+system(cmd)
+```
+
+Read the sample ids.
+
+```{r}
+filename <- "../results/training_sample_ids.tsv.gz"
+train_ids <- read_tsv(filename)
+```
+
+```{r}
+pheno_cov <- read_tsv("/tmp/cov_pheno.tsv.gz")
+```
+
+Mask out those individuals not in the train set.
+
+```{r}
+pheno_cov <- pheno_cov %>% mutate(train_E4_IRON_MET = if_else(FID %in% train_ids$FID, E4_IRON_MET, NA))
+```
+
+```{r}
+pheno_cov %>% select(ends_with("E4_IRON_MET")) %>% mutate(across(everything(), as.factor)) %>% summary()
+pheno_cov %>% select(ends_with("E4_IRON_MET")) %>% table(useNA = "always")
+```
+
+## Create the input files for the pipeline
+
+```{r}
+filename <- "/tmp/hla_hc_pheno_cov.tsv.gz"
+write_tsv(pheno_cov, filename)
+```
+
+```{r}
+filename <- "/tmp/hla_hc_phenolist.txt"
+cat("train_E4_IRON_MET", file=filename, sep="\n")
+```
+
+```{r}
+filename <- "../data/hla_bgen_list.txt"
+cat(c("gs://fg-production-sandbox-5-red/toivoja/hemochromatosis/R12_ncHLA.bgen", 
+      "gs://finngen-production-library-red/finngen_R12/hla_1.0/bgen/R12_HLA.bgen"),
+    file=filename, sep="\n")
+```
+
+Fix the sample file so that sample IDs corresponds to FINNGEN ids.
+
+```{r}
+filename <- "../data/R12_ncHLA.sample"
+sample <- read_delim(filename, delim=" ")
+sample_first_line <- sample %>% head(1) %>% mutate(ID_1 = as.character(ID_1))
+sample_rest <- sample[-1, ]    # Drop the first row
+sample_rest <- sample_rest %>% 
+  select(-ID_1) %>% 
+  separate_wider_delim(ID_2, delim="_", names=c("ID_1", "ID_2"))
+sample <- bind_rows(sample_first_line, sample_rest)
+output_filename <- "../data/R12_ncHLA.bgen.sample"
+write_delim(sample, output_filename, delim=" ")
+```
+
+## Non-adjusted
+
+### Copy files to red
+
+```{r}
+cmd <- glue("gsutil cp /tmp/hla_hc_pheno_cov.tsv.gz /tmp/hla_hc_phenolist.txt ../data/hla_bgen_list.txt ../data/R12_ncHLA.bgen* {hc_red}")
+print(cmd)
+system(cmd)
+```
+
+### Run the pipeline
+
+```{r}
+wdl  <- "/finngen/library-green/scripts/regenie/regenie.wdl"
+json <- "json/hla_hemochromatosis_gwas_R12.json"
+zip  <- "/finngen/library-green/scripts/regenie/regenie_sub_wdl.zip"
+cmd  <- glue("finngen-cli request-workflow --wdl {wdl} --input {json} -d {zip}")
+print(cmd)
+system(cmd)
+```
+
+These are from the old bad train/test split:
+The result for non-classical HLAs has ID 0694994b-77c0-4a5c-a4c9-f1b7ad0b2c63
+The result for classical HLAs has ID bced4498-c512-4ef1-a5de-5f0adba21020
+I originally ran these separately, but subsequently added both bgens to bgenlist.
+The summary call failed, but the original Regenie results are still ok.
+
+This is from the new split:
+f6ea764a-9b03-4854-8fc5-2f1e9b8e3c5b
+Again the run failed (in the call-summary), but results are still available.	
+
+### Show the results
+
+Read the results.
+
+```{r, eval=FALSE}
+# Old result
+filename <- "../results/train_E4_IRON_MET.nonclassical_hla.regenie.gz"
+results_nonclassical <- read_delim(filename, delim=" ")
+```
+
+```{r, eval=FALSE}
+# Old result
+filename <- "../results/train_E4_IRON_MET.classical_hla.regenie.gz"
+results_classical <- read_delim(filename, delim=" ")
+```
+
+```{r}
+filename <- "../results/train_E4_IRON_MET.hla.regenie.gz"
+results <- read_delim(filename, delim=" ")
+results <- cleanup(results, hla_order)
+```
+
+```{r}
+results %>% mutate()
+```
+
+
+```{r}
+#g <- hla_manhattan_plot(list(Classical=results_classical, Nonclassical=results_nonclassical), hla_order)
+g <- hla_manhattan_plot(results)
+if (save_figs) {
+  filename <- file.path(figure_path, "hla_manhattan.pdf")
+  ggsave(filename, g, width=9, height=3.5, title="HLA Manhattan")
+}
+g
+```
+
+```{r}
+g <- results %>% 
+  ggplot(aes(BETA, LOG10P)) + 
+  geom_vline(xintercept = 0, color="gray") +
+  geom_point() +
+  lims(x=c(-1, 1)) +
+  labs(x="Beta", y=expression(-log[10](p)))
+  #facet_grid(~ id, scales = "free")
+if (save_figs) {
+  filename <- file.path(figure_path, "hla_vulcano.pdf")
+  ggsave(filename, g, title="HLA vulcano")
+}
+g
+```
+
+
+
+Looks like a parabola.
+
+
+
+## Adjusted by five snips
+
+Adjusted by the five "known" snips.
+
+Read the original pheno_cov file.
+
+```{r}
+filename <- "/finngen/red/toivoja/hemochromatosis/hla_hc_pheno_cov.tsv.gz"
+pheno_cov <- read_tsv(filename)
+```
+
+Read the dosages of the five snips.
+
+```{r}
+dosages <- read_delim("../results/snips.dosage", delim=" ")
+```
+
+```{r}
+dosages <- dosages %>% select(-c(chromosome, rsid, position, alleleA, alleleB))
+dosages2 <- dosages %>% column_to_rownames("SNPID") %>% t() %>% as_tibble(rownames = "FID")
+```
+
+```{r}
+pheno_cov <- pheno_cov %>%
+  inner_join(dosages2, by="FID")
+```
+
+```{r}
+write_tsv(pheno_cov, "/tmp/hla_hc_pheno_cov_adjusted.tsv.gz")
+```
+
+### Copy files to red
+
+```{r}
+cmd <- glue("gsutil cp /tmp/hla_hc_pheno_cov_adjusted.tsv.gz ../data/hla_bgen_list.txt {hc_red}")
+print(cmd)
+system(cmd)
+```
+
+### Run the pipeline
+
+```{r}
+wdl  <- "/finngen/library-green/scripts/regenie/regenie.wdl"
+json <- "json/hla_hemochromatosis_gwas_adjusted_R12.json"
+zip  <- "/finngen/library-green/scripts/regenie/regenie_sub_wdl.zip"
+cmd  <- glue("finngen-cli request-workflow --wdl {wdl} --input {json} -d {zip}")
+print(cmd)
+system(cmd)
+```
+
+This is from the old train-test division:
+ID was 30f69a68-19dd-446c-816a-adbab5fa1232
+
+This is the new division (2025-02-25):
+5207f0cf-842f-4b9c-9f55-1312ad23230d
+
+### Show results
+
+```{r}
+filename <- "../results/train_E4_IRON_MET.adjusted_hla.regenie.gz"
+results_adjusted <- read_delim(filename, delim=" ")
+results_adjusted <- cleanup(results_adjusted, hla_order) 
+```
+
+```{r}
+g <- hla_manhattan_plot(results_adjusted)
+if (save_figs) {
+  filename <- file.path(figure_path, "adjusted_hla_manhattan.pdf")
+  ggsave(filename, g, width=9, height=3.5, title="Adjusted HLA Manhattan")
+}
+g
+```
+
+```{r}
+g <- results_adjusted %>% 
+  ggplot(aes(BETA, LOG10P)) + 
+  geom_vline(xintercept = 0, color="gray") +
+  geom_point() +
+  labs(x="Beta", y=expression(-log[10](p))) +
+  #facet_grid(~ id, scales = "free") +
+  lims(x = c(-1, 1))
+g 
+if (save_figs) {
+  filename <- file.path(figure_path, "adjusted_hla_vulcano.pdf")
+  ggsave(filename, g, title="Adjusted HLA vulcano")
+}
+```
+
+## C282Y adjusted
+
+Adjust by a single snip only.
+
+### Run the pipeline
+
+```{r}
+wdl  <- "/finngen/library-green/scripts/regenie/regenie.wdl"
+json <- "json/hla_hemochromatosis_gwas_C282Y_adjusted_R12.json"
+zip  <- "/finngen/library-green/scripts/regenie/regenie_sub_wdl.zip"
+cmd  <- glue("finngen-cli request-workflow --wdl {wdl} --input {json} -d {zip}")
+print(cmd)
+system(cmd)
+```
+
+Based on old train-test division:
+Id: e86ecc68-181f-45be-a3d4-737605c1d9bc, took 5.5 hours
+
+New division (2025-02-25):
+f69f7d97-0b1c-493e-82e1-3bbd9116bbf0
+
+### Show results
+
+```{r}
+filename <- "../results/train_E4_IRON_MET.C282Y_adjusted_hla.regenie.gz"
+results_C282Y_adjusted <- read_delim(filename, delim=" ")
+results_C282Y_adjusted <- cleanup(results_C282Y_adjusted, hla_order)
+```
+
+```{r}
+g <- hla_manhattan_plot(results_C282Y_adjusted)
+if (save_figs) {
+  filename <- file.path(figure_path, "C282Y_adjusted_hla_manhattan.pdf")
+  ggsave(filename, g, width=9, height=3.5, title="C282Y adjusted HLA Manhattan")
+}
+g
+```
+
+```{r}
+g <- results_C282Y_adjusted %>% 
+  ggplot(aes(BETA, LOG10P)) + 
+  geom_vline(xintercept = 0, color="gray") +
+  geom_point() +
+  labs(x="Beta", y=expression(-log[10](p))) +
+  #facet_grid(~ id, scales = "free") +
+  lims(x = c(-1, 1))
+g
+if (save_figs) {
+  filename <- file.path(figure_path, "C282Y_adjusted_hla_vulcano.pdf")
+  ggsave(filename, g, title="C282Y adjusted HLA vulcano")
+}
+```
+
+
+
+
